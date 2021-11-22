@@ -1,0 +1,1 @@
+python train.py --dataset face_sr --artifacts tdsr --generator DeResnet --discriminator FSD --norm_layer Instance --filter wavelet --cat_or_sum cat  --batch_size 200  --num_workers 12 --crop_size 62 --save_path 0618_DeResnet+wavcat+FSD+wtex0.03
