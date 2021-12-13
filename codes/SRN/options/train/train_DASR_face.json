@@ -13,9 +13,9 @@
         "train": {
             "name": "DIV2K",
             "mode": "LRHR_wavelet_unpair_fake_weights_EQ",
-            "dataroot_HR": "/media/4T/Dizzy/AIM/AIM_datasets/DIV2K_train_HR",
-            "dataroot_fake_LR": "../../DSN_results/0603_DSN_LRs_aim2019/imgs_from_target",
-            "dataroot_real_LR": "/media/4T/Dizzy/AIM/AIM_datasets/TrainingSource",
+            "dataroot_HR": "D:/Dataset/FFHQ/train",
+            "dataroot_fake_LR": "D:/Dataset/FFHQ/train_lr",
+            "dataroot_real_LR": "D:/Dataset/face_dataset_comp/train",
             "dataroot_fake_weights": "../../DSN_results/0603_DSN_LRs_aim2019/ddm_target",
             "subset_file": null,
             "use_shuffle": true,
@@ -23,7 +23,7 @@
             "batch_size": 6,
             "HR_size": 128,
             "use_flip": true,
-            "use_rot": true
+            "use_rot": true,
         },
         "val": {
             "name": "validation",
@@ -93,7 +93,8 @@
         "D_update_inter": 1,
         "manual_seed": 0,
         "niter": 350000.0,
-        "val_freq": 2500.0
+        "val_freq": 2500.0,
+        "face_mask_coef": 1
     },
     "logger": {
         "print_freq": 200,

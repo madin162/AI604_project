@@ -14,6 +14,8 @@ from data.util import bgr2ycbcr
 from data import create_dataset, create_dataloader
 from models import create_model
 
+from torchvision import transforms
+
 # options
 parser = argparse.ArgumentParser()
 parser.add_argument('-opt', type=str, required=True,
@@ -63,6 +65,8 @@ def __main__():
         for data in test_loader:
             need_HR = False if test_loader.dataset.opt['dataroot_HR'] is None else True
 
+            data['LR'] = transforms.Resize(
+                [512, 512])(data['LR'])
             model.feed_data(data, False)
             img_path = data['LR_path'][0]
             img_name = os.path.splitext(os.path.basename(img_path))[0]

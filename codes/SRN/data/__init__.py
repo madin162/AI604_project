@@ -36,8 +36,14 @@ def create_dataset(dataset_opt):
         from data.LRHR_wavelet_unpairEq_fake_w_dataset import LRHR_wavelet_Equnpair_Dataset as D
     elif mode == 'LRHR_unpair':
         from data.LRHR_unpair_dataset import LRHR_unpair_Dataset as D
+    elif mode == 'LRHR_HiFaceGAN':
+        from data.LRHR_HiFaceGAN_dataset import HiFaceGAN_Dataset as D
+
+    # create dataloader for real-face SR.
+    # Include image landmark transformation
     else:
-        raise NotImplementedError('Dataset [{:s}] is not recognized.'.format(mode))
+        raise NotImplementedError(
+            'Dataset [{:s}] is not recognized.'.format(mode))
     dataset = D(dataset_opt)
     logger = logging.getLogger('base')
     logger.info('Dataset [{:s} - {:s}] is created.'.format(dataset.__class__.__name__,

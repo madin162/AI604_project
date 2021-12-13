@@ -9,66 +9,606 @@ import functools
 import torch.nn.functional as F
 from pytorch_wavelets import DWTForward
 from utils.util import b_split, b_merge
+import re
+import torch.nn.utils.spectral_norm as spectral_norm
+from models.modules.sync_batchnorm import SynchronizedBatchNorm2d
+from torch.nn import init
+
+######
+# Base Network
+######
+
+
+class dotdict(dict):
+    """dot.notation access to dictionary attributes"""
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+
+class InstanceNorm2d(nn.Module):
+    def __init__(self, epsilon=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def forward(self, x):
+        #x = x - torch.mean(x, (2, 3), True)
+        tmp = torch.mul(x, x)  # or x ** 2
+        tmp = torch.rsqrt(torch.mean(tmp, (2, 3), True) + self.epsilon)
+        return x * tmp
+
+
+class SPADE(nn.Module):
+    def __init__(self, config_text, norm_nc, label_nc):
+        super().__init__()
+
+        assert config_text.startswith('spade')
+        parsed = re.search('spade(\D+)(\d)x\d', config_text)
+        param_free_norm_type = str(parsed.group(1))
+        ks = int(parsed.group(2))
+
+        if param_free_norm_type == 'instance':
+            self.param_free_norm = InstanceNorm2d(norm_nc)
+        elif param_free_norm_type == 'syncbatch':
+            self.param_free_norm = SynchronizedBatchNorm2d(
+                norm_nc, affine=False)
+        elif param_free_norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm2d(norm_nc, affine=False)
+        else:
+            raise ValueError('%s is not a recognized param-free norm type in SPADE'
+                             % param_free_norm_type)
+
+        # The dimension of the intermediate embedding space. Yes, hardcoded.
+        nhidden = 128 if norm_nc > 128 else norm_nc
+
+        pw = ks // 2
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=ks, padding=pw),
+            nn.ReLU()
+        )
+        self.mlp_gamma = nn.Conv2d(
+            nhidden, norm_nc, kernel_size=ks, padding=pw, bias=False)
+        self.mlp_beta = nn.Conv2d(
+            nhidden, norm_nc, kernel_size=ks, padding=pw, bias=False)
+
+    def forward(self, x, segmap):
+
+        # Part 1. generate parameter-free normalized activations
+        normalized = self.param_free_norm(x)
+
+        # Part 2. produce scaling and bias conditioned on semantic map
+        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        actv = self.mlp_shared(segmap)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+
+        # apply scale and bias
+        out = normalized * gamma + beta
+
+        return out
+
+
+class SPADEResnetBlock(nn.Module):
+    def __init__(self, fin, fout, opt, semantic_nc=None):
+        super().__init__()
+        # Attributes
+        self.learned_shortcut = (fin != fout)
+        fmiddle = min(fin, fout)
+        if semantic_nc is None:
+            semantic_nc = opt.semantic_nc
+
+        # create conv layers
+        self.conv_0 = nn.Conv2d(fin, fmiddle, kernel_size=3, padding=1)
+        self.conv_1 = nn.Conv2d(fmiddle, fout, kernel_size=3, padding=1)
+        if self.learned_shortcut:
+            self.conv_s = nn.Conv2d(fin, fout, kernel_size=1, bias=False)
+
+        # apply spectral norm if specified
+        if 'spectral' in opt.norm_G:
+            self.conv_0 = spectral_norm(self.conv_0)
+            self.conv_1 = spectral_norm(self.conv_1)
+            if self.learned_shortcut:
+                self.conv_s = spectral_norm(self.conv_s)
+
+        # define normalization layers
+        spade_config_str = opt.norm_G.replace('spectral', '')
+        self.norm_0 = SPADE(spade_config_str, fin, semantic_nc)
+        self.norm_1 = SPADE(spade_config_str, fmiddle, semantic_nc)
+        if self.learned_shortcut:
+            self.norm_s = SPADE(spade_config_str, fin, semantic_nc)
+
+    # note the resnet block with SPADE also takes in |seg|,
+    # the semantic segmentation map as input
+    def forward(self, x, seg):
+        x_s = self.shortcut(x, seg)
+
+        dx = self.conv_0(self.actvn(self.norm_0(x, seg)))
+        dx = self.conv_1(self.actvn(self.norm_1(dx, seg)))
+
+        out = x_s + dx
+
+        return out
+
+    def shortcut(self, x, seg):
+        if self.learned_shortcut:
+            x_s = self.conv_s(self.norm_s(x, seg))
+        else:
+            x_s = x
+        return x_s
+
+    def actvn(self, x):
+        return F.leaky_relu(x, 2e-1)
+
+
+class BaseNetwork(nn.Module):
+    def __init__(self):
+        super(BaseNetwork, self).__init__()
+
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        return parser
+
+    def print_network(self):
+        if isinstance(self, list):
+            self = self[0]
+        num_params = 0
+        for param in self.parameters():
+            num_params += param.numel()
+        print('Network [%s] was created. Total number of parameters: %.1f million. '
+              'To see the architecture, do print(network).'
+              % (type(self).__name__, num_params / 1000000))
+
+    def init_weights(self, init_type='normal', gain=0.02):
+        def init_func(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm2d') != -1:
+                if hasattr(m, 'weight') and m.weight is not None:
+                    init.normal_(m.weight.data, 1.0, gain)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    init.constant_(m.bias.data, 0.0)
+            elif hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+                if init_type == 'normal':
+                    init.normal_(m.weight.data, 0.0, gain)
+                elif init_type == 'xavier':
+                    init.xavier_normal_(m.weight.data, gain=gain)
+                elif init_type == 'xavier_uniform':
+                    init.xavier_uniform_(m.weight.data, gain=1.0)
+                elif init_type == 'kaiming':
+                    init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+                elif init_type == 'orthogonal':
+                    init.orthogonal_(m.weight.data, gain=gain)
+                elif init_type == 'none':  # uses pytorch's default init method
+                    m.reset_parameters()
+                else:
+                    raise NotImplementedError(
+                        'initialization method [%s] is not implemented' % init_type)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    init.constant_(m.bias.data, 0.0)
+
+        self.apply(init_func)
+
+        # propagate to children
+        for m in self.children():
+            if hasattr(m, 'init_weights'):
+                m.init_weights(init_type, gain)
+
+
+def lip2d(x, logit, kernel=3, stride=2, padding=1):
+    weight = logit.exp()
+    return F.avg_pool2d(x*weight, kernel, stride, padding) / F.avg_pool2d(weight, kernel, stride, padding)
+
+
+class SoftGate(nn.Module):
+    COEFF = 12.0
+
+    def __init__(self):
+        super(SoftGate, self).__init__()
+
+    def forward(self, x):
+        return torch.sigmoid(x).mul(self.COEFF)
+
+
+class SimplifiedLIP(nn.Module):
+    def __init__(self, channels):
+        super(SimplifiedLIP, self).__init__()
+
+        rp = channels
+
+        self.logit = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.InstanceNorm2d(channels, affine=True),
+            SoftGate()
+        )
+        '''
+        OrderedDict((
+            ('conv', nn.Conv2d(channels, channels, 3, padding=1, bias=False)),
+            ('bn', nn.InstanceNorm2d(channels, affine=True)),
+            ('gate', SoftGate()),
+        ))
+        '''
+
+    def init_layer(self):
+        self.logit[0].weight.data.fill_(0.0)
+
+    def forward(self, x):
+        frac = lip2d(x, self.logit(x))
+        return frac
+
 
 ####################
 # Generator
 ####################
 
+class SPADEGenerator(BaseNetwork):
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        parser.set_defaults(norm_G='spectralspadesyncbatch3x3')
+        parser.add_argument('--num_upsampling_layers',
+                            choices=('normal', 'more', 'most'), default='normal',
+                            help="If 'more', adds upsampling layer between the two middle resnet blocks. If 'most', also add one more upsampling + resnet layer at the end of the generator")
+
+        return parser
+
+    def __init__(self, opt):
+        super().__init__()
+        opt = dotdict(opt)
+        self.opt = opt
+        nf = opt.nf
+
+        self.sw, self.sh, self.scale_ratio = self.compute_latent_vector_size(
+            opt)
+
+        if opt.use_vae:
+            # In case of VAE, we will sample from random z vector
+            self.fc = nn.Linear(opt.z_dim, 16 * nf * self.sw * self.sh)
+        else:
+            # Otherwise, we make the network deterministic by starting with
+            # downsampled segmentation map instead of random z
+            self.fc = nn.Conv2d(self.opt.semantic_nc, 16 * nf, 3, padding=1)
+
+        self.head_0 = SPADEResnetBlock(16 * nf, 16 * nf, opt)
+
+        self.G_middle_0 = SPADEResnetBlock(16 * nf, 16 * nf, opt)
+        self.G_middle_1 = SPADEResnetBlock(16 * nf, 16 * nf, opt)
+
+        # 20200211 test 4x with only 3 stage
+
+        self.ups = nn.ModuleList([
+            SPADEResnetBlock(16 * nf, 8 * nf, opt),
+            SPADEResnetBlock(8 * nf, 4 * nf, opt),
+            SPADEResnetBlock(4 * nf, 2 * nf, opt),
+            SPADEResnetBlock(2 * nf, 1 * nf, opt)  # here
+        ])
+
+        self.to_rgbs = nn.ModuleList([
+            nn.Conv2d(8 * nf, 3, 3, padding=1),
+            nn.Conv2d(4 * nf, 3, 3, padding=1),
+            nn.Conv2d(2 * nf, 3, 3, padding=1),
+            nn.Conv2d(1 * nf, 3, 3, padding=1)      # here
+        ])
+
+        self.up = nn.Upsample(scale_factor=2)
+
+    # 20200309 interface for flexible encoder design
+    # and mid-level loss control!
+    # For basic network, it's just a 16x downsampling
+    def encode(self, input):
+        h, w = input.size()[-2:]
+        sh, sw = h//2**self.scale_ratio, w//2**self.scale_ratio
+        x = F.interpolate(input, size=(sh, sw))
+        return self.fc(x)  # 20200310: Merge fc into encoder
+
+    def compute_latent_vector_size(self, opt):
+        if opt.num_upsampling_layers == 'normal':
+            num_up_layers = 5
+        elif opt.num_upsampling_layers == 'more':
+            num_up_layers = 6
+        elif opt.num_upsampling_layers == 'most':
+            num_up_layers = 7
+        else:
+            raise ValueError('opt.num_upsampling_layers [%s] not recognized' %
+                             opt.num_upsampling_layers)
+
+        # 20200211 Yang Lingbo with respect to phase
+        scale_ratio = num_up_layers
+        # scale_ratio = 4  #here
+        sw = opt.crop_size // (2**num_up_layers)
+        sh = round(sw / opt.aspect_ratio)
+
+        return sw, sh, scale_ratio
+
+    def forward(self, input, seg=None):
+        '''
+            20200307: Dangerous Change
+            Add separable forward to allow different 
+            input and segmentation maps...
+
+            To return to original, simply add
+            seg = input at begining, and disable the seg parameter.
+
+            20200308: A more elegant solution:
+            @ Allow forward to take default parameters.
+            @ Allow customizable input encoding
+
+            20200310: Merge fc into encode, since encoder directly outputs processed feature map.
+
+            [TODO] @ Allow customizable segmap encoding?
+        '''
+
+        if seg is None:
+            seg = input  # Interesting change...
+
+        # For basic generator, 16x downsampling.
+        # 20200310: Merge fc into encoder
+        x = self.encode(input)
+        #print(x.shape, input.shape, seg.shape)
+
+        x = self.head_0(x, seg)
+
+        x = self.up(x)
+        x = self.G_middle_0(x, seg)
+        x = self.G_middle_1(x, seg)
+
+        if self.opt.is_test:
+            phase = len(self.to_rgbs)
+        else:
+            phase = self.opt.train_phase+1
+
+        for i in range(phase):
+            x = self.up(x)
+            x = self.ups[i](x, seg)
+
+        x = self.to_rgbs[phase-1](F.leaky_relu(x, 2e-1))
+        x = torch.tanh(x)
+
+        return x
+
+    def mixed_guidance_forward(self, input, seg=None, n=0, mode='progressive'):
+        '''
+            mixed_forward: input and seg are different images
+            For the first n levels (including encoder)
+            we use input, for the rest we use seg.
+
+            If mode = 'progressive', the output's like: AAABBB
+            If mode = 'one_plug', the output's like:    AAABAA
+            If mode = 'one_ablate', the output's like:  BBBABB
+        '''
+
+        if seg is None:
+            return self.forward(input)
+
+        if self.opt.is_test:
+            phase = len(self.to_rgbs)
+        else:
+            phase = self.opt.train_phase+1
+
+        if mode == 'progressive':
+            n = max(min(n, 4 + phase), 0)
+            guide_list = [input] * n + [seg] * (4+phase-n)
+        elif mode == 'one_plug':
+            n = max(min(n, 4 + phase-1), 0)
+            guide_list = [seg] * (4+phase)
+            guide_list[n] = input
+        elif mode == 'one_ablate':
+            if n > 3+phase:
+                return self.forward(input)
+            guide_list = [input] * (4+phase)
+            guide_list[n] = seg
+
+        x = self.encode(guide_list[0])
+        x = self.head_0(x, guide_list[1])
+
+        x = self.up(x)
+        x = self.G_middle_0(x, guide_list[2])
+        x = self.G_middle_1(x, guide_list[3])
+
+        for i in range(phase):
+            x = self.up(x)
+            x = self.ups[i](x, guide_list[4+i])
+
+        x = self.to_rgbs[phase-1](F.leaky_relu(x, 2e-1))
+        x = torch.tanh(x)
+
+        return x
+
+
+class HiFaceGANGenerator(SPADEGenerator):
+    def __init__(self, opt):
+        super().__init__(opt)
+        opt = dotdict(opt)
+        self.opt = opt
+        nf = opt.nf
+
+        self.sw, self.sh, self.scale_ratio = self.compute_latent_vector_size(
+            opt)
+
+        if opt.use_vae:
+            # In case of VAE, we will sample from random z vector
+            self.fc = nn.Linear(opt.z_dim, 16 * nf * self.sw * self.sh)
+        else:
+            # Otherwise, we make the network deterministic by starting with
+            # downsampled segmentation map instead of random z
+            self.fc = nn.Conv2d(self.opt.semantic_nc, 16 * nf, 3, padding=1)
+
+        self.head_0 = SPADEResnetBlock(16 * nf, 16 * nf, opt, 16 * nf)
+
+        self.G_middle_0 = SPADEResnetBlock(16 * nf, 16 * nf, opt, 16 * nf)
+        self.G_middle_1 = SPADEResnetBlock(16 * nf, 16 * nf, opt, 16 * nf)
+
+        # 20200211 test 4x with only 3 stage
+
+        # edit upsample on last block
+        self.ups = nn.ModuleList([
+            SPADEResnetBlock(16 * nf, 8 * nf, opt, 8 * nf),
+            SPADEResnetBlock(8 * nf, 4 * nf, opt, 4 * nf),
+            SPADEResnetBlock(4 * nf, 2 * nf, opt, 2 * nf),
+            SPADEResnetBlock(2 * nf, 1 * nf, opt, 1 * nf)  # here
+        ])
+
+        self.to_rgbs = nn.ModuleList([
+            nn.Conv2d(8 * nf, 3, 3, padding=1),
+            nn.Conv2d(4 * nf, 3, 3, padding=1),
+            nn.Conv2d(2 * nf, 3, 3, padding=1),
+            nn.Conv2d(1 * nf, 3, 3, padding=1)      # here
+        ])
+
+        self.up = nn.Upsample(scale_factor=2)
+        self.encoder = ContentAdaptiveSuppresor(
+            opt, self.sw, self.sh, self.scale_ratio)
+
+        # self.upres = nn.ModuleList[nn.ReflectionPad2d(3), nn.Conv2d(
+        #    nf, output_nc, kernel_size=7, padding=0), nn.Tanh()]
+
+    def nested_encode(self, x):
+        return self.encoder(x)
+
+    def forward(self, input):
+        xs = self.nested_encode(input)
+        x = self.encode(input)
+        # print(x.shape)
+        '''
+        print([_x.shape for _x in xs])
+        print(x.shape)
+        print(self.head_0)
+        '''
+        x = self.head_0(x, xs[0])
+        # print(x.shape)
+        x = self.up(x)
+        # print(x.shape)
+        x = self.G_middle_0(x, xs[1])
+        # print(x.shape)
+        x = self.G_middle_1(x, xs[1])
+        # print(x.shape)
+
+        if self.opt.is_test:
+            phase = len(self.to_rgbs)
+        else:
+            phase = self.opt.train_phase+1
+
+        for i in range(phase):
+            x = self.up(x)
+            x = self.ups[i](x, xs[i+2])
+
+        # Upsampling
+        #x = self.up(x)
+
+        x = self.to_rgbs[phase-1](F.leaky_relu(x, 2e-1))
+        x = torch.tanh(x)
+        # print(x.shape)
+
+        return x
+
+
+class ContentAdaptiveSuppresor(BaseNetwork):
+    def __init__(self, opt, sw, sh, n_2xdown,
+                 norm_layer=nn.InstanceNorm2d):
+        super().__init__()
+        self.sw = sw
+        self.sh = sh
+        self.max_ratio = 16
+        self.n_2xdown = n_2xdown
+
+        # norm_layer = get_nonspade_norm_layer(opt, opt.norm_E)
+
+        # 20200310: Several Convolution (stride 1) + LIP blocks, 4 fold
+        ngf = opt.ngf
+        kw = 3
+        pw = (kw - 1) // 2
+
+        self.head = nn.Sequential(
+            nn.Conv2d(opt.semantic_nc, ngf, kw,
+                      stride=1, padding=pw, bias=False),
+            norm_layer(ngf),
+            nn.ReLU(),
+        )
+        cur_ratio = 1
+        for i in range(n_2xdown):
+            next_ratio = min(cur_ratio*2, self.max_ratio)
+            model = [
+                SimplifiedLIP(ngf*cur_ratio),
+                nn.Conv2d(ngf*cur_ratio, ngf*next_ratio,
+                          kw, stride=1, padding=pw),
+                norm_layer(ngf*next_ratio),
+            ]
+            cur_ratio = next_ratio
+            if i < n_2xdown - 1:
+                model += [nn.ReLU(inplace=True)]
+            setattr(self, 'encoder_%d' % i, nn.Sequential(*model))
+
+    def forward(self, x):
+        # 20200628: Note the features are arranged from small to large
+        x = [self.head(x)]
+        for i in range(self.n_2xdown):
+            net = getattr(self, 'encoder_%d' % i)
+            x = [net(x[0])] + x
+        return x
+
 
 class SRResNet(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, upscale=4, norm_type='batch', act_type='relu', \
-            mode='NAC', res_scale=1, upsample_mode='upconv'):
+    def __init__(self, in_nc, out_nc, nf, nb, upscale=4, norm_type='batch', act_type='relu',
+                 mode='NAC', res_scale=1, upsample_mode='upconv'):
         super(SRResNet, self).__init__()
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
-        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,\
-            mode=mode, res_scale=res_scale) for _ in range(nb)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
+        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,
+                                       mode=mode, res_scale=res_scale) for _ in range(nb)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
 
         if upsample_mode == 'upconv':
             upsample_block = B.upconv_blcok
         elif upsample_mode == 'pixelshuffle':
             upsample_block = B.pixelshuffle_block
         else:
-            raise NotImplementedError('upsample mode [{:s}] is not found'.format(upsample_mode))
+            raise NotImplementedError(
+                'upsample mode [{:s}] is not found'.format(upsample_mode))
         if upscale == 3:
             upsampler = upsample_block(nf, nf, 3, act_type=act_type)
         else:
-            upsampler = [upsample_block(nf, nf, act_type=act_type) for _ in range(n_upscale)]
-        HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
-        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
+            upsampler = [upsample_block(nf, nf, act_type=act_type)
+                         for _ in range(n_upscale)]
+        HR_conv0 = B.conv_block(nf, nf, kernel_size=3,
+                                norm_type=None, act_type=act_type)
+        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3,
+                                norm_type=None, act_type=None)
 
-        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),\
-            *upsampler, HR_conv0, HR_conv1)
+        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),
+                                  *upsampler, HR_conv0, HR_conv1)
 
     def forward(self, x):
         x = self.model(x)
         return x
 
+
 class De_Resnet(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, downscale=4, norm_type='batch', act_type='prelu', \
-            mode='NAC', res_scale=1):
+    def __init__(self, in_nc, out_nc, nf, nb, downscale=4, norm_type='batch', act_type='prelu',
+                 mode='NAC', res_scale=1):
         super(De_Resnet, self).__init__()
         n_downscale = int(math.log(downscale, 2))
         # if upscale == 3:
         #     n_downscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
-        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,\
-            mode=mode, res_scale=res_scale) for _ in range(nb)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
+        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,
+                                       mode=mode, res_scale=res_scale) for _ in range(nb)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv0 = B.conv_block(
+            nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv1 = B.conv_block(
+            nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
 
         down_conv = [B.conv_block_downsample(nf, nf, kernel_size=3, stride=2, norm_type=None, act_type=act_type)
                      for _ in range(n_downscale)]
         # downsampleConv0 = B.conv_block_downsample(nf, nf, kernel_size=3, stride=2, norm_type=None, act_type=act_type)
         # downsampleConv1 = B.conv_block_downsample(nf, nf, kernel_size=3, stride=2, norm_type=None, act_type=act_type)
-        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),\
-            B.sequential(*down_conv), After_D_conv0, After_D_conv1)
+        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),
+                                  B.sequential(*down_conv), After_D_conv0, After_D_conv1)
 
     def forward(self, x):
         x = self.model(x)
@@ -76,20 +616,25 @@ class De_Resnet(nn.Module):
 
 
 class De_Resnet_bilinear(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, downscale=4, norm_type='batch', act_type='relu', \
-            mode='NAC', res_scale=1):
+    def __init__(self, in_nc, out_nc, nf, nb, downscale=4, norm_type='batch', act_type='relu',
+                 mode='NAC', res_scale=1):
         super(De_Resnet_bilinear, self).__init__()
         # n_downscale = int(math.log(downscale, 2))
         # if upscale == 3:
         #     n_downscale = 1
         self.downscale = downscale
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
-        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,\
-            mode=mode, res_scale=res_scale) for _ in range(nb)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)))
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
+        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,
+                                       mode=mode, res_scale=res_scale) for _ in range(nb)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv0 = B.conv_block(
+            nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv1 = B.conv_block(
+            nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        self.model = B.sequential(fea_conv, B.ShortcutBlock(
+            B.sequential(*resnet_blocks, LR_conv)))
         self.bilinear1 = F.interpolate
         # self.bilinear2 = F.interpolate
         self.Afterconv = B.sequential(After_D_conv0, After_D_conv1)
@@ -109,7 +654,8 @@ class DSGAN_Generator(nn.Module):
             nn.Conv2d(3, 64, kernel_size=3, padding=1),
             nn.PReLU()
         )
-        self.res_blocks = nn.ModuleList([ResidualBlock(64) for _ in range(n_res_blocks)])
+        self.res_blocks = nn.ModuleList(
+            [ResidualBlock(64) for _ in range(n_res_blocks)])
         self.block_output = nn.Conv2d(64, 3, kernel_size=3, padding=1)
 
     def forward(self, x):
@@ -135,19 +681,23 @@ class ResidualBlock(nn.Module):
 
 
 class De_Resnetdx2(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, downscale=2, norm_type='batch', act_type='relu', \
-            mode='NAC', res_scale=1):
+    def __init__(self, in_nc, out_nc, nf, nb, downscale=2, norm_type='batch', act_type='relu',
+                 mode='NAC', res_scale=1):
         super(De_Resnetdx2, self).__init__()
         # n_downscale = int(math.log(downscale, 2))
         # if upscale == 3:
         #     n_downscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
-        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,\
-            mode=mode, res_scale=res_scale) for _ in range(nb)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
-        After_D_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
+        resnet_blocks = [B.ResNetBlock(nf, nf, nf, norm_type=norm_type, act_type=act_type,
+                                       mode=mode, res_scale=res_scale) for _ in range(nb)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv0 = B.conv_block(
+            nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        After_D_conv1 = B.conv_block(
+            nf, out_nc, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
 
         # if upsample_mode == 'upconv':
         #     upsample_block = B.upconv_blcok
@@ -162,9 +712,10 @@ class De_Resnetdx2(nn.Module):
         # HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
         # HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
 
-        downsampleConv0 = B.conv_block_downsample(nf, nf, kernel_size=3, stride=2, norm_type=None, act_type=act_type)
-        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),\
-            downsampleConv0, After_D_conv0, After_D_conv1)
+        downsampleConv0 = B.conv_block_downsample(
+            nf, nf, kernel_size=3, stride=2, norm_type=None, act_type=act_type)
+        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*resnet_blocks, LR_conv)),
+                                  downsampleConv0, After_D_conv0, After_D_conv1)
 
     def forward(self, x):
         x = self.model(x)
@@ -172,33 +723,39 @@ class De_Resnetdx2(nn.Module):
 
 
 class RRDBNet(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None, \
-            act_type='leakyrelu', mode='CNA', upsample_mode='upconv'):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None,
+                 act_type='leakyrelu', mode='CNA', upsample_mode='upconv'):
         super(RRDBNet, self).__init__()
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
-        rb_blocks = [B.RRDB(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero', \
-            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
+        rb_blocks = [B.RRDB(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
+                            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
 
         if upsample_mode == 'upconv':
             upsample_block = B.upconv_blcok
         elif upsample_mode == 'pixelshuffle':
             upsample_block = B.pixelshuffle_block
         else:
-            raise NotImplementedError('upsample mode [{:s}] is not found'.format(upsample_mode))
+            raise NotImplementedError(
+                'upsample mode [{:s}] is not found'.format(upsample_mode))
         if upscale == 3:
             upsampler = upsample_block(nf, nf, 3, act_type=act_type)
         else:
-            upsampler = [upsample_block(nf, nf, act_type=act_type) for _ in range(n_upscale)]
-        HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
-        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
+            upsampler = [upsample_block(nf, nf, act_type=act_type)
+                         for _ in range(n_upscale)]
+        HR_conv0 = B.conv_block(nf, nf, kernel_size=3,
+                                norm_type=None, act_type=act_type)
+        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3,
+                                norm_type=None, act_type=None)
 
-        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*rb_blocks, LR_conv)),\
-            *upsampler, HR_conv0, HR_conv1)
+        self.model = B.sequential(fea_conv, B.ShortcutBlock(B.sequential(*rb_blocks, LR_conv)),
+                                  *upsampler, HR_conv0, HR_conv1)
 
     def forward(self, x):
         x = self.model(x)
@@ -206,32 +763,38 @@ class RRDBNet(nn.Module):
 
 
 class RRDBNet_Residual_conv(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None, \
-            act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None,
+                 act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
         super(RRDBNet_Residual_conv, self).__init__()
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
         rb_blocks = [B.RRDB(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
+                            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
         rb_blocks_adaptive = [B.RRDB_Residual_conv(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-                                    norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+                                                   norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
 
         if upsample_mode == 'upconv':
             upsample_block = B.upconv_blcok
         elif upsample_mode == 'pixelshuffle':
             upsample_block = B.pixelshuffle_block
         else:
-            raise NotImplementedError('upsample mode [{:s}] is not found'.format(upsample_mode))
+            raise NotImplementedError(
+                'upsample mode [{:s}] is not found'.format(upsample_mode))
         if upscale == 3:
             upsampler = upsample_block(nf, nf, 3, act_type=act_type)
         else:
-            upsampler = [upsample_block(nf, nf, act_type=act_type) for _ in range(n_upscale)]
-        HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
-        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
+            upsampler = [upsample_block(nf, nf, act_type=act_type)
+                         for _ in range(n_upscale)]
+        HR_conv0 = B.conv_block(nf, nf, kernel_size=3,
+                                norm_type=None, act_type=act_type)
+        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3,
+                                norm_type=None, act_type=None)
 
         self.fea_conv = fea_conv
         self.rb_blocks = B.sequential(*rb_blocks)
@@ -252,32 +815,38 @@ class RRDBNet_Residual_conv(nn.Module):
 
 
 class RRDBNet_Residual_conv_concat(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None, \
-            act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None,
+                 act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
         super(RRDBNet_Residual_conv_concat, self).__init__()
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
         rb_blocks = [B.RRDB(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
+                            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
         rb_blocks_adaptive = [B.RRDB_Residual_conv_concat(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-                                    norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+                                                          norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
 
         if upsample_mode == 'upconv':
             upsample_block = B.upconv_blcok
         elif upsample_mode == 'pixelshuffle':
             upsample_block = B.pixelshuffle_block
         else:
-            raise NotImplementedError('upsample mode [{:s}] is not found'.format(upsample_mode))
+            raise NotImplementedError(
+                'upsample mode [{:s}] is not found'.format(upsample_mode))
         if upscale == 3:
             upsampler = upsample_block(nf, nf, 3, act_type=act_type)
         else:
-            upsampler = [upsample_block(nf, nf, act_type=act_type) for _ in range(n_upscale)]
-        HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
-        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
+            upsampler = [upsample_block(nf, nf, act_type=act_type)
+                         for _ in range(n_upscale)]
+        HR_conv0 = B.conv_block(nf, nf, kernel_size=3,
+                                norm_type=None, act_type=act_type)
+        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3,
+                                norm_type=None, act_type=None)
 
         self.fea_conv = fea_conv
         self.rb_blocks = B.sequential(*rb_blocks)
@@ -295,7 +864,6 @@ class RRDBNet_Residual_conv_concat(nn.Module):
         x += x_fea
         x = self.up_conv(x)
         return x
-
 
 
 class ResnetGenerator(nn.Module):
@@ -326,7 +894,8 @@ class ResnetGenerator(nn.Module):
 
         mult = 2**n_downsampling
         for i in range(n_blocks):
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+            model += [ResnetBlock(ngf * mult, padding_type=padding_type,
+                                  norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
 
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
@@ -349,7 +918,8 @@ class ResnetGenerator(nn.Module):
 class ResnetBlock(nn.Module):
     def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
         super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.conv_block = self.build_conv_block(
+            dim, padding_type, norm_layer, use_dropout, use_bias)
 
     def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
         conv_block = []
@@ -361,7 +931,8 @@ class ResnetBlock(nn.Module):
         elif padding_type == 'zero':
             p = 1
         else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+            raise NotImplementedError(
+                'padding [%s] is not implemented' % padding_type)
 
         conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
                        norm_layer(dim),
@@ -377,7 +948,8 @@ class ResnetBlock(nn.Module):
         elif padding_type == 'zero':
             p = 1
         else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+            raise NotImplementedError(
+                'padding [%s] is not implemented' % padding_type)
         conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
                        norm_layer(dim)]
 
@@ -547,33 +1119,33 @@ class Discriminator_VGG_96(nn.Module):
         # features
         # hxw, c
         # 96, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
-            mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
+                             mode=mode)
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 48, 64
-        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 24, 12857
-        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 12, 256
-        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 6, 512
-        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 3, 512
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,\
-            conv9)
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
+                                     conv9)
 
         # classifier
         self.classifier = nn.Sequential(
@@ -585,39 +1157,40 @@ class Discriminator_VGG_96(nn.Module):
         x = self.classifier(x)
         return x
 
+
 class Discriminator_VGG_patch(nn.Module):
     def __init__(self, in_nc, base_nf, norm_type='batch', act_type='leakyrelu', mode='CNA'):
         super(Discriminator_VGG_patch, self).__init__()
         # features
         # hxw, c
         # 96, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
-            mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
+                             mode=mode)
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 48, 64
-        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 24, 12857
-        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 12, 256
-        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 6, 512
-        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 3, 512
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,\
-            conv9)
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
+                                     conv9)
 
         # classifier
         # self.classifier = nn.Sequential(
@@ -630,46 +1203,45 @@ class Discriminator_VGG_patch(nn.Module):
         return x
 
 
-
 class Discriminator_VGG_192(nn.Module):
     def __init__(self, in_nc, base_nf, norm_type='batch', act_type='leakyrelu', mode='CNA'):
         super(Discriminator_VGG_192, self).__init__()
         # features
         # hxw, c
         # 192, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
-            mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
+                             mode=mode)
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 96, 64
-        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 48, 128
-        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 24, 256
-        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 12, 512
-        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 6, 512
-        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                              act_type=act_type, mode=mode)
 
         # 3, 512
-        conv11 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv11 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type,
                               act_type=act_type, mode=mode)
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,\
-            conv9, conv10, conv11)
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
+                                     conv9, conv10, conv11)
 
         # classifier
         self.classifier = nn.Sequential(
@@ -681,43 +1253,44 @@ class Discriminator_VGG_192(nn.Module):
         x = self.classifier(x)
         return x
 
+
 class Discriminator_VGG_192_wavelet(nn.Module):
     def __init__(self, in_nc, base_nf, norm_type='batch', act_type='leakyrelu', mode='CNA'):
         super(Discriminator_VGG_192_wavelet, self).__init__()
         # features
         # hxw, c
         # 192, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
                              mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type,
                              act_type=act_type, mode=mode)
         # 96, 64
-        conv2 = B.conv_block(base_nf, base_nf * 2, kernel_size=3, stride=1, norm_type=norm_type, \
+        conv2 = B.conv_block(base_nf, base_nf * 2, kernel_size=3, stride=1, norm_type=norm_type,
                              act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf * 2, base_nf * 2, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv3 = B.conv_block(base_nf * 2, base_nf * 2, kernel_size=4, stride=2, norm_type=norm_type,
                              act_type=act_type, mode=mode)
         # 48, 128
-        conv4 = B.conv_block(base_nf * 2, base_nf * 4, kernel_size=3, stride=1, norm_type=norm_type, \
+        conv4 = B.conv_block(base_nf * 2, base_nf * 4, kernel_size=3, stride=1, norm_type=norm_type,
                              act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf * 4, base_nf * 4, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv5 = B.conv_block(base_nf * 4, base_nf * 4, kernel_size=4, stride=2, norm_type=norm_type,
                              act_type=act_type, mode=mode)
         # 24, 256
-        conv6 = B.conv_block(base_nf * 4, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type, \
+        conv6 = B.conv_block(base_nf * 4, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type,
                              act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv7 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type,
                              act_type=act_type, mode=mode)
         # 12, 512
-        conv8 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type, \
+        conv8 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type,
                              act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv9 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type,
                              act_type=act_type, mode=mode)
         # 6, 512
-        conv10 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type, \
+        conv10 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=3, stride=1, norm_type=norm_type,
                               act_type=act_type, mode=mode)
-        conv11 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type, \
+        conv11 = B.conv_block(base_nf * 8, base_nf * 8, kernel_size=4, stride=2, norm_type=norm_type,
                               act_type=act_type, mode=mode)
         # 3, 512
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8, \
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
                                      conv9, conv10, conv11)
 
         # classifier
@@ -737,38 +1310,38 @@ class Discriminator_VGG_96_patch(nn.Module):
         # features
         # hxw, c
         # 192, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
-            mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
+                             mode=mode)
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 96, 64
-        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 48, 128
-        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 24, 256
-        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 12, 512
-        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 6, 512
-        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                              act_type=act_type, mode=mode)
         # conv11 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
         #     act_type=act_type, mode=mode)
         # 3, 512
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,\
-            conv9, conv10)
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
+                                     conv9, conv10)
 
         # classifier
         # self.classifier = nn.Sequential(
@@ -780,44 +1353,45 @@ class Discriminator_VGG_96_patch(nn.Module):
         # x = self.classifier(x)
         return x
 
+
 class Discriminator_VGG_48(nn.Module):
     def __init__(self, in_nc, base_nf, norm_type='batch', act_type='leakyrelu', mode='CNA'):
         super(Discriminator_VGG_48, self).__init__()
         # features
         # hxw, c
         # 48, 64
-        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type, \
-            mode=mode)
-        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv0 = B.conv_block(in_nc, base_nf, kernel_size=3, norm_type=None, act_type=act_type,
+                             mode=mode)
+        conv1 = B.conv_block(base_nf, base_nf, kernel_size=4, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 96, 64
-        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv2 = B.conv_block(base_nf, base_nf*2, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv3 = B.conv_block(base_nf*2, base_nf*2, kernel_size=4, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 48, 128
-        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv4 = B.conv_block(base_nf*2, base_nf*4, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv5 = B.conv_block(base_nf*4, base_nf*4, kernel_size=4, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 24, 256
-        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv6 = B.conv_block(base_nf*4, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv7 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 12, 512
-        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv8 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
+        conv9 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                             act_type=act_type, mode=mode)
         # 6, 512
-        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
-        conv11 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type, \
-            act_type=act_type, mode=mode)
+        conv10 = B.conv_block(base_nf*8, base_nf*8, kernel_size=3, stride=1, norm_type=norm_type,
+                              act_type=act_type, mode=mode)
+        conv11 = B.conv_block(base_nf*8, base_nf*8, kernel_size=4, stride=2, norm_type=norm_type,
+                              act_type=act_type, mode=mode)
         # 3, 512
-        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,\
-            conv9, conv10, conv11)
+        self.features = B.sequential(conv0, conv1, conv2, conv3, conv4, conv5, conv6, conv7, conv8,
+                                     conv9, conv10, conv11)
 
         # classifier
         self.classifier = nn.Sequential(
@@ -864,41 +1438,47 @@ class DiscriminatorBasic(nn.Module):
                 nn.Conv2d(256, 1, kernel_size=1)
             )
         else:
-            raise NotImplemented('{} norm layer is not recognized'.format(norm_layer))
+            raise NotImplemented(
+                '{} norm layer is not recognized'.format(norm_layer))
 
     def forward(self, x):
         return self.net(x)
 
 
 class RRDBNet_SEAN(nn.Module):
-    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None, \
-            act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None,
+                 act_type='leakyrelu', mode='CNA', upsample_mode='upconv', nb_ada=1):
         super(RRDBNet_SEAN, self).__init__()
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
 
-        fea_conv = B.conv_block(in_nc, nf, kernel_size=3, norm_type=None, act_type=None)
+        fea_conv = B.conv_block(in_nc, nf, kernel_size=3,
+                                norm_type=None, act_type=None)
         rb_blocks = [B.RRDB(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
+                            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb)]
         rb_blocks_ada = [B.RRDB_SEAN(nf, kernel_size=3, gc=32, stride=1, bias=True, pad_type='zero',
-            norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
+                                     norm_type=norm_type, act_type=act_type, mode='CNA') for _ in range(nb_ada)]
 
-
-        LR_conv = B.conv_block(nf, nf, kernel_size=3, norm_type=norm_type, act_type=None, mode=mode)
+        LR_conv = B.conv_block(nf, nf, kernel_size=3,
+                               norm_type=norm_type, act_type=None, mode=mode)
 
         if upsample_mode == 'upconv':
             upsample_block = B.upconv_blcok
         elif upsample_mode == 'pixelshuffle':
             upsample_block = B.pixelshuffle_block
         else:
-            raise NotImplementedError('upsample mode [{:s}] is not found'.format(upsample_mode))
+            raise NotImplementedError(
+                'upsample mode [{:s}] is not found'.format(upsample_mode))
         if upscale == 3:
             upsampler = upsample_block(nf, nf, 3, act_type=act_type)
         else:
-            upsampler = [upsample_block(nf, nf, act_type=act_type) for _ in range(n_upscale)]
-        HR_conv0 = B.conv_block(nf, nf, kernel_size=3, norm_type=None, act_type=act_type)
-        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3, norm_type=None, act_type=None)
+            upsampler = [upsample_block(nf, nf, act_type=act_type)
+                         for _ in range(n_upscale)]
+        HR_conv0 = B.conv_block(nf, nf, kernel_size=3,
+                                norm_type=None, act_type=act_type)
+        HR_conv1 = B.conv_block(nf, out_nc, kernel_size=3,
+                                norm_type=None, act_type=None)
 
         self.fea_conv = fea_conv
         self.rb_blocks = B.sequential(*rb_blocks)
@@ -916,7 +1496,6 @@ class RRDBNet_SEAN(nn.Module):
         x += x_fea
         x = self.up_conv(x)
         return x
-
 
 
 class FS_Discriminator(nn.Module):
@@ -940,22 +1519,31 @@ class FS_Discriminator(nn.Module):
                 self.cs = cs
                 n_input_channel = 9 if self.cs == 'cat' else 3
             else:
-                raise NotImplementedError('Frequency Separation type [{:s}] not recognized'.format(filter_type))
-            print('# FS type: {}, kernel size={}'.format(filter_type.lower(), kernel_size))
+                raise NotImplementedError(
+                    'Frequency Separation type [{:s}] not recognized'.format(filter_type))
+            print('# FS type: {}, kernel size={}'.format(
+                filter_type.lower(), kernel_size))
         else:
             self.filter = None
 
         if D_arch.lower() == 'nld_s1':
-            self.net = NLayerDiscriminator(input_nc=n_input_channel, ndf=64, n_layers=2, norm_layer=norm_layer, stride=1)
-            print('# Initializing NLayer-Discriminator-stride-1 with {} norm-layer'.format(norm_layer.upper()))
+            self.net = NLayerDiscriminator(
+                input_nc=n_input_channel, ndf=64, n_layers=2, norm_layer=norm_layer, stride=1)
+            print(
+                '# Initializing NLayer-Discriminator-stride-1 with {} norm-layer'.format(norm_layer.upper()))
         elif D_arch.lower() == 'nld_s2':
-            self.net = NLayerDiscriminator(input_nc=n_input_channel, ndf=64, n_layers=2, norm_layer=norm_layer, stride=2)
-            print('#Initializing NLayer-Discriminator-stride-2 with {} norm-layer'.format(norm_layer.upper()))
+            self.net = NLayerDiscriminator(
+                input_nc=n_input_channel, ndf=64, n_layers=2, norm_layer=norm_layer, stride=2)
+            print(
+                '#Initializing NLayer-Discriminator-stride-2 with {} norm-layer'.format(norm_layer.upper()))
         elif D_arch.lower() == 'fsd':
-            self.net = DiscriminatorBasic(n_input_channels=n_input_channel, norm_layer=norm_layer)
-            print('# Initializing FSSR-DiscriminatorBasic with {} norm layer'.format(norm_layer))
+            self.net = DiscriminatorBasic(
+                n_input_channels=n_input_channel, norm_layer=norm_layer)
+            print(
+                '# Initializing FSSR-DiscriminatorBasic with {} norm layer'.format(norm_layer))
         else:
-            raise NotImplementedError('Discriminator architecture [{:s}] not recognized'.format(D_arch))
+            raise NotImplementedError(
+                'Discriminator architecture [{:s}] not recognized'.format(D_arch))
 
     def forward(self, x, y=None):
         if self.filter is not None:
@@ -969,7 +1557,8 @@ class FS_Discriminator(nn.Module):
 
     def filter_wavelet(self, x, norm=True):
         LL, Hc = self.DWT2(x)
-        LH, HL, HH = Hc[0][:, :, 0, :, :], Hc[0][:, :, 1, :, :], Hc[0][:, :, 2, :, :]
+        LH, HL, HH = Hc[0][:, :, 0, :, :], Hc[0][:,
+                                                 :, 1, :, :], Hc[0][:, :, 2, :, :]
         if norm:
             LH, HL, HH = LH * 0.5 + 0.5, HL * 0.5 + 0.5, HH * 0.5 + 0.5
         if self.cs.lower() == 'sum':
@@ -977,7 +1566,8 @@ class FS_Discriminator(nn.Module):
         elif self.cs.lower() == 'cat':
             return torch.cat((LH, HL, HH), 1)
         else:
-            raise NotImplementedError('Wavelet format [{:s}] not recognized'.format(self.cs))
+            raise NotImplementedError(
+                'Wavelet format [{:s}] not recognized'.format(self.cs))
 
 
 class NLayerDiscriminator(nn.Module):
@@ -995,14 +1585,16 @@ class NLayerDiscriminator(nn.Module):
         use_bias = False
         kw = 4
         padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
+        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw,
+                              stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
         nf_mult = 1
         nf_mult_prev = 1
         for n in range(1, n_layers):  # gradually increase the number of filters
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult,
+                          kernel_size=kw, stride=2, padding=padw, bias=use_bias),
                 norm_layer(ndf * nf_mult),
                 nn.LeakyReLU(0.2, True)
             ]
@@ -1010,12 +1602,15 @@ class NLayerDiscriminator(nn.Module):
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
+            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult,
+                      kernel_size=kw, stride=1, padding=padw, bias=use_bias),
             norm_layer(ndf * nf_mult),
             nn.LeakyReLU(0.2, True)
         ]
 
-        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
+        # output 1 channel prediction map
+        sequence += [nn.Conv2d(ndf * nf_mult, 1,
+                               kernel_size=kw, stride=1, padding=padw)]
         # TODO
         self.model = nn.Sequential(*sequence)
 
@@ -1033,13 +1628,13 @@ class NLayerDiscriminator(nn.Module):
     #                 own_state[name].copy_(param)
     #             except Exception:
     #                 print(name)
-                    # if name.find('tail') >= 0:
-                    #     print('Replace pre-trained upsampler to new one...')
-                    # else:
-                    #     raise RuntimeError('While copying the parameter named {}, '
-                    #                        'whose dimensions in the model are {} and '
-                    #                        'whose dimensions in the checkpoint are {}.'
-                    #                        .format(name, own_state[name].size(), param.size()))
+        # if name.find('tail') >= 0:
+        #     print('Replace pre-trained upsampler to new one...')
+        # else:
+        #     raise RuntimeError('While copying the parameter named {}, '
+        #                        'whose dimensions in the model are {} and '
+        #                        'whose dimensions in the checkpoint are {}.'
+        #                        .format(name, own_state[name].size(), param.size()))
         #     elif strict:
         #         if name.find('tail') == -1:
         #             raise KeyError('unexpected key "{}" in state_dict'
@@ -1070,13 +1665,16 @@ class VGGFeatureExtractor(nn.Module):
             model = torchvision.models.vgg19(pretrained=True)
         self.use_input_norm = use_input_norm
         if self.use_input_norm:
-            mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+            mean = torch.Tensor([0.485, 0.456, 0.406]).view(
+                1, 3, 1, 1).to(device)
             # [0.485-1, 0.456-1, 0.406-1] if input in range [-1,1]
-            std = torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+            std = torch.Tensor([0.229, 0.224, 0.225]).view(
+                1, 3, 1, 1).to(device)
             # [0.229*2, 0.224*2, 0.225*2] if input in range [-1,1]
             self.register_buffer('mean', mean)
             self.register_buffer('std', std)
-        self.features = nn.Sequential(*list(model.features.children())[:(feature_layer + 1)])
+        self.features = nn.Sequential(
+            *list(model.features.children())[:(feature_layer + 1)])
         # No need to BP to variable
         for k, v in self.features.named_parameters():
             v.requires_grad = False
@@ -1095,9 +1693,11 @@ class ResNet101FeatureExtractor(nn.Module):
         model = torchvision.models.resnet101(pretrained=True)
         self.use_input_norm = use_input_norm
         if self.use_input_norm:
-            mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+            mean = torch.Tensor([0.485, 0.456, 0.406]).view(
+                1, 3, 1, 1).to(device)
             # [0.485-1, 0.456-1, 0.406-1] if input in range [-1,1]
-            std = torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+            std = torch.Tensor([0.229, 0.224, 0.225]).view(
+                1, 3, 1, 1).to(device)
             # [0.229*2, 0.224*2, 0.225*2] if input in range [-1,1]
             self.register_buffer('mean', mean)
             self.register_buffer('std', std)
@@ -1158,8 +1758,8 @@ class MINCNet(nn.Module):
 
 # Assume input range is [0, 1]
 class MINCFeatureExtractor(nn.Module):
-    def __init__(self, feature_layer=34, use_bn=False, use_input_norm=True, \
-                device=torch.device('cpu')):
+    def __init__(self, feature_layer=34, use_bn=False, use_input_norm=True,
+                 device=torch.device('cpu')):
         super(MINCFeatureExtractor, self).__init__()
 
         self.features = MINCNet()
@@ -1174,6 +1774,7 @@ class MINCFeatureExtractor(nn.Module):
         output = self.features(x)
         return output
 
+
 class GaussianFilter(nn.Module):
     def __init__(self, kernel_size=5, stride=1, padding=4):
         super(GaussianFilter, self).__init__()
@@ -1187,7 +1788,8 @@ class GaussianFilter(nn.Module):
         xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
 
         # Calculate the 2-dimensional gaussian kernel
-        gaussian_kernel = torch.exp(-torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance))
+        gaussian_kernel = torch.exp(-torch.sum((xy_grid - mean)
+                                    ** 2., dim=-1) / (2 * variance))
 
         # Make sure sum of values in gaussian kernel equals 1.
         gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
@@ -1197,7 +1799,8 @@ class GaussianFilter(nn.Module):
         gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
 
         # create gaussian filter as convolutional layer
-        self.gaussian_filter = nn.Conv2d(3, 3, kernel_size, stride=stride, padding=padding, groups=3, bias=False)
+        self.gaussian_filter = nn.Conv2d(
+            3, 3, kernel_size, stride=stride, padding=padding, groups=3, bias=False)
         self.gaussian_filter.weight.data = gaussian_kernel
         self.gaussian_filter.weight.requires_grad = False
 
@@ -1213,9 +1816,11 @@ class FilterLow(nn.Module):
         else:
             pad = 0
         if gaussian:
-            self.filter = GaussianFilter(kernel_size=kernel_size, stride=stride, padding=pad)
+            self.filter = GaussianFilter(
+                kernel_size=kernel_size, stride=stride, padding=pad)
         else:
-            self.filter = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=pad, count_include_pad=include_pad)
+            self.filter = nn.AvgPool2d(
+                kernel_size=kernel_size, stride=stride, padding=pad, count_include_pad=include_pad)
         self.recursions = recursions
 
     def forward(self, img):
@@ -1241,4 +1846,3 @@ class FilterHigh(nn.Module):
             return 0.5 + img * 0.5
         else:
             return img
-

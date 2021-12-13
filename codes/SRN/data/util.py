@@ -10,7 +10,8 @@ import logging
 
 from PIL import Image
 
-IMG_EXTENSIONS = ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP']
+IMG_EXTENSIONS = ['.jpg', '.JPG', '.jpeg', '.JPEG',
+                  '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP']
 
 ####################
 # Files & IO
@@ -38,7 +39,8 @@ def _get_paths_from_images(path):
 
 
 def _get_paths_from_lmdb(dataroot):
-    env = lmdb.open(dataroot, readonly=True, lock=False, readahead=False, meminit=False)
+    env = lmdb.open(dataroot, readonly=True, lock=False,
+                    readahead=False, meminit=False)
     keys_cache_file = os.path.join(dataroot, '_keys_cache.p')
     logger = logging.getLogger('base')
     if os.path.isfile(keys_cache_file):
@@ -61,7 +63,8 @@ def get_image_paths(data_type, dataroot):
         elif data_type == 'img':
             paths = sorted(_get_paths_from_images(dataroot))
         else:
-            raise NotImplementedError('data_type [{:s}] is not recognized.'.format(data_type))
+            raise NotImplementedError(
+                'data_type [{:s}] is not recognized.'.format(data_type))
     return env, paths
 
 
@@ -90,6 +93,7 @@ def read_img(env, path):
         img = img[:, :, :3]
     return img
 
+
 def read_img_seg(env, path):
     # read image by cv2 or from lmdb
     # return: Numpy float32, HWC, BGR, [0,1]
@@ -112,7 +116,7 @@ def read_img_seg(env, path):
 # process on numpy image
 ####################
 
-
+# Augment with image affine transformation here
 def augment(img_list, hflip=True, rot=True):
     # horizontal flip OR rotate
     hflip = hflip and random.random() < 0.5
@@ -120,12 +124,24 @@ def augment(img_list, hflip=True, rot=True):
     rot90 = rot and random.random() < 0.5
 
     def _augment(img):
-        if hflip: img = img[:, ::-1, :]
-        if vflip: img = img[::-1, :, :]
-        if rot90: img = img.transpose(1, 0, 2)
+        if hflip:
+            img = img[:, ::-1, :]
+        if vflip:
+            img = img[::-1, :, :]
+        if rot90:
+            img = img.transpose(1, 0, 2)
         return img
 
     return [_augment(img) for img in img_list]
+
+
+def reshape_HR(img_list, hr_size=(512, 512)):
+    # horizontal flip OR rotate
+    def _reshape(img):
+        img = cv2.resize(img, dsize=hr_size, interpolation=cv2.INTER_CUBIC)
+        return img
+
+    return [_reshape(img) for img in img_list]
 
 
 def channel_convert(in_c, tar_type, img_list):
@@ -237,7 +253,8 @@ def cubic(x):
     absx2 = absx**2
     absx3 = absx**3
     return (1.5*absx3 - 2.5*absx2 + 1) * ((absx <= 1).type_as(absx)) + \
-        (-0.5*absx3 + 2.5*absx2 - 4*absx + 2) * (((absx > 1)*(absx <= 2)).type_as(absx))
+        (-0.5*absx3 + 2.5*absx2 - 4*absx + 2) * \
+        (((absx > 1)*(absx <= 2)).type_as(absx))
 
 
 def calculate_weights_indices(in_length, out_length, scale, kernel, kernel_width, antialiasing):
@@ -301,7 +318,8 @@ def imresize(img, scale, antialiasing=True):
     # output: CHW RGB [0,1] w/o round
 
     in_C, in_H, in_W = img.size()
-    out_C, out_H, out_W = in_C, math.ceil(in_H * scale), math.ceil(in_W * scale)
+    out_C, out_H, out_W = in_C, math.ceil(
+        in_H * scale), math.ceil(in_W * scale)
     kernel_width = 4
     kernel = 'cubic'
 
@@ -334,9 +352,12 @@ def imresize(img, scale, antialiasing=True):
     kernel_width = weights_H.size(1)
     for i in range(out_H):
         idx = int(indices_H[i][0])
-        out_1[0, i, :] = img_aug[0, idx:idx + kernel_width, :].transpose(0, 1).mv(weights_H[i])
-        out_1[1, i, :] = img_aug[1, idx:idx + kernel_width, :].transpose(0, 1).mv(weights_H[i])
-        out_1[2, i, :] = img_aug[2, idx:idx + kernel_width, :].transpose(0, 1).mv(weights_H[i])
+        out_1[0, i, :] = img_aug[0, idx:idx + kernel_width,
+                                 :].transpose(0, 1).mv(weights_H[i])
+        out_1[1, i, :] = img_aug[1, idx:idx + kernel_width,
+                                 :].transpose(0, 1).mv(weights_H[i])
+        out_1[2, i, :] = img_aug[2, idx:idx + kernel_width,
+                                 :].transpose(0, 1).mv(weights_H[i])
 
     # process W dimension
     # symmetric copying
@@ -357,9 +378,12 @@ def imresize(img, scale, antialiasing=True):
     kernel_width = weights_W.size(1)
     for i in range(out_W):
         idx = int(indices_W[i][0])
-        out_2[0, :, i] = out_1_aug[0, :, idx:idx + kernel_width].mv(weights_W[i])
-        out_2[1, :, i] = out_1_aug[1, :, idx:idx + kernel_width].mv(weights_W[i])
-        out_2[2, :, i] = out_1_aug[2, :, idx:idx + kernel_width].mv(weights_W[i])
+        out_2[0, :, i] = out_1_aug[0, :, idx:idx +
+                                   kernel_width].mv(weights_W[i])
+        out_2[1, :, i] = out_1_aug[1, :, idx:idx +
+                                   kernel_width].mv(weights_W[i])
+        out_2[2, :, i] = out_1_aug[2, :, idx:idx +
+                                   kernel_width].mv(weights_W[i])
 
     return out_2
 
@@ -371,7 +395,8 @@ def imresize_np(img, scale, antialiasing=True):
     img = torch.from_numpy(img)
 
     in_H, in_W, in_C = img.size()
-    out_C, out_H, out_W = in_C, math.ceil(in_H * scale), math.ceil(in_W * scale)
+    out_C, out_H, out_W = in_C, math.ceil(
+        in_H * scale), math.ceil(in_W * scale)
     kernel_width = 4
     kernel = 'cubic'
 
@@ -404,9 +429,12 @@ def imresize_np(img, scale, antialiasing=True):
     kernel_width = weights_H.size(1)
     for i in range(out_H):
         idx = int(indices_H[i][0])
-        out_1[i, :, 0] = img_aug[idx:idx + kernel_width, :, 0].transpose(0, 1).mv(weights_H[i])
-        out_1[i, :, 1] = img_aug[idx:idx + kernel_width, :, 1].transpose(0, 1).mv(weights_H[i])
-        out_1[i, :, 2] = img_aug[idx:idx + kernel_width, :, 2].transpose(0, 1).mv(weights_H[i])
+        out_1[i, :, 0] = img_aug[idx:idx + kernel_width,
+                                 :, 0].transpose(0, 1).mv(weights_H[i])
+        out_1[i, :, 1] = img_aug[idx:idx + kernel_width,
+                                 :, 1].transpose(0, 1).mv(weights_H[i])
+        out_1[i, :, 2] = img_aug[idx:idx + kernel_width,
+                                 :, 2].transpose(0, 1).mv(weights_H[i])
 
     # process W dimension
     # symmetric copying
@@ -427,9 +455,12 @@ def imresize_np(img, scale, antialiasing=True):
     kernel_width = weights_W.size(1)
     for i in range(out_W):
         idx = int(indices_W[i][0])
-        out_2[:, i, 0] = out_1_aug[:, idx:idx + kernel_width, 0].mv(weights_W[i])
-        out_2[:, i, 1] = out_1_aug[:, idx:idx + kernel_width, 1].mv(weights_W[i])
-        out_2[:, i, 2] = out_1_aug[:, idx:idx + kernel_width, 2].mv(weights_W[i])
+        out_2[:, i, 0] = out_1_aug[:, idx:idx +
+                                   kernel_width, 0].mv(weights_W[i])
+        out_2[:, i, 1] = out_1_aug[:, idx:idx +
+                                   kernel_width, 1].mv(weights_W[i])
+        out_2[:, i, 2] = out_1_aug[:, idx:idx +
+                                   kernel_width, 2].mv(weights_W[i])
 
     return out_2.numpy()
 
@@ -438,11 +469,9 @@ def onehot(seg):
     res = np.zeros([seg.shape[0], seg.shape[1], 183])
     mask = seg.astype(np.uint8)
     for idx in range(183):
-        res[:,:, idx] = (mask==idx).reshape(res[:,:,idx].shape)
+        res[:, :, idx] = (mask == idx).reshape(res[:, :, idx].shape)
 
     return res
-
-
 
 
 if __name__ == '__main__':
@@ -466,7 +495,6 @@ if __name__ == '__main__':
     # torchvision.utils.save_image(
     #     (rlt * 255).round() / 255, '/media/4T/Dizzy/SR_classical_DataSet/NTIRE2019/Ori_datasets/Plot/cam1_01.png', nrow=1, padding=0, normalize=False)
 
-
     # test imresize function
     # read images
     import torchvision.utils
@@ -475,7 +503,8 @@ if __name__ == '__main__':
     for i in os.listdir(imgpath):
         img = cv2.imread(imgpath+i)
         img = img * 1.0 / 255
-        img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float()
+        img = torch.from_numpy(np.transpose(
+            img[:, :, [2, 1, 0]], (2, 0, 1))).float()
         # imresize
         scale = 4
         rlt = imresize(img, scale, antialiasing=True)

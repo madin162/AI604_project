@@ -66,12 +66,14 @@ def init_weights(net, init_type='kaiming', scale=1, std=0.02):
         weights_init_normal_ = functools.partial(weights_init_normal, std=std)
         net.apply(weights_init_normal_)
     elif init_type == 'kaiming':
-        weights_init_kaiming_ = functools.partial(weights_init_kaiming, scale=scale)
+        weights_init_kaiming_ = functools.partial(
+            weights_init_kaiming, scale=scale)
         net.apply(weights_init_kaiming_)
     elif init_type == 'orthogonal':
         net.apply(weights_init_orthogonal)
     else:
-        raise NotImplementedError('initialization method [{:s}] not implemented'.format(init_type))
+        raise NotImplementedError(
+            'initialization method [{:s}] not implemented'.format(init_type))
 
 
 ####################
@@ -84,66 +86,73 @@ def define_G(opt):
     gpu_ids = opt['gpu_ids']
     opt_net = opt['network_G']
     which_model = opt_net['which_model_G']
+    print(opt_net)
 
     if which_model == 'sr_resnet':  # SRResNet
-        netG = arch.SRResNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'], \
-            nb=opt_net['nb'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'], \
-            act_type='relu', mode=opt_net['mode'], upsample_mode='pixelshuffle')
+        netG = arch.SRResNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
+                             nb=opt_net['nb'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                             act_type='relu', mode=opt_net['mode'], upsample_mode='pixelshuffle')
+
+    elif which_model == 'HiFaceGAN':  # HiFaceGAN
+        netG = arch.HiFaceGANGenerator(opt_net)
 
     elif which_model == 'sft_arch':  # SFT-GAN
         netG = sft_arch.SFT_Net()
 
     elif which_model == 'RRDB_net':  # RRDB
         netG = arch.RRDBNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
-            nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
-            act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv')
+                            nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                            act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv')
     elif which_model == 'RRDB_mask':
         netG = arch.RRDBNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
                             nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'],
                             norm_type=opt_net['norm_type'],
                             act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv')
     elif which_model == 'De_Resnet':
-        netG = arch.De_Resnet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'], \
-            nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'], \
-            act_type=opt_net['act_type'], mode=opt_net['mode'])
+        netG = arch.De_Resnet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
+                              nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                              act_type=opt_net['act_type'], mode=opt_net['mode'])
 
     elif which_model == 'DSGAN':
         netG = arch.DSGAN_Generator()
 
     elif which_model == 'De_Resnet_bilinear':
-        netG = arch.De_Resnet_bilinear(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'], \
-            nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'], \
-            act_type='relu', mode=opt_net['mode'])
+        netG = arch.De_Resnet_bilinear(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
+                                       nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                                       act_type='relu', mode=opt_net['mode'])
 
     elif which_model == 'De_Resnet2xd':
-        netG = arch.De_Resnetdx2(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'], \
-            nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'], \
-            act_type='relu', mode=opt_net['mode'])
+        netG = arch.De_Resnetdx2(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
+                                 nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                                 act_type='relu', mode=opt_net['mode'])
 
     elif which_model == 'De_RRDB':
-        netG = arch.De_Resnet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'], \
-            nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'], \
-            act_type='relu', mode=opt_net['mode'])
+        netG = arch.De_Resnet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
+                              nb=opt_net['nb'], downscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                              act_type='relu', mode=opt_net['mode'])
     elif which_model == 'RRDB_SEAN':
         netG = arch.RRDBNet_SEAN(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
-            nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
-            act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv', nb_ada=opt_net['ada_nb'])
+                                 nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                                 act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv', nb_ada=opt_net['ada_nb'])
     elif which_model == 'RRDB_Residual_conv':  # RRDB
         netG = arch.RRDBNet_Residual_conv(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
-            nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
-            act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv')
+                                          nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                                          act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv')
     elif which_model == 'RRDB_Residual_conv_concat':  # RRDB
         netG = arch.RRDBNet_Residual_conv_concat(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'], nf=opt_net['nf'],
-            nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
-            act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv', nb_ada=opt_net['ada_nb'])
+                                                 nb=opt_net['nb'], gc=opt_net['gc'], upscale=opt_net['scale'], norm_type=opt_net['norm_type'],
+                                                 act_type='leakyrelu', mode=opt_net['mode'], upsample_mode='upconv', nb_ada=opt_net['ada_nb'])
     else:
-        raise NotImplementedError('Generator model [{:s}] not recognized'.format(which_model))
+        raise NotImplementedError(
+            'Generator model [{:s}] not recognized'.format(which_model))
 
     if opt['is_train']:
-        init_weights(netG, init_type='kaiming', scale=0.1)
+        if which_model != 'HiFaceGAN':
+            init_weights(netG, init_type='kaiming', scale=0.1)
     if gpu_ids:
         assert torch.cuda.is_available()
-        netG = nn.DataParallel(netG)
+        #netG = nn.DataParallel(netG)
+        netG = netG.to('cuda')
     return netG
 
 
@@ -156,42 +165,47 @@ def define_D(opt):
     if which_model == 'discriminator_vgg_128':
         # netD = arch.Discriminator_VGG_128(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
         #     norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
-        netD = arch.Discriminator_VGG_128(in_nc=opt_net['in_nc'],  nf=opt_net['nf'])
+        netD = arch.Discriminator_VGG_128(
+            in_nc=opt_net['in_nc'],  nf=opt_net['nf'])
 
     elif which_model == 'dis_acd':  # sft-gan, Auxiliary Classifier Discriminator
         netD = sft_arch.ACD_VGG_BN_96()
 
     elif which_model == 'discriminator_vgg_96':
-        netD = arch.Discriminator_VGG_96(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_96(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                         norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_96_patch':
-        netD = arch.Discriminator_VGG_96_patch(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_96_patch(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                               norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_192':
-        netD = arch.Discriminator_VGG_192(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_192(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                          norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_192_wavelet':
-        netD = arch.Discriminator_VGG_192_wavelet(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_192_wavelet(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                                  norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_patch':
-        netD = arch.Discriminator_VGG_patch(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_patch(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_48':
-        netD = arch.Discriminator_VGG_48(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_48(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                         norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_128_SN':
         netD = arch.Discriminator_VGG_128_SN()
     elif which_model == 'discriminator_patch':
-        netD = arch.NLayerDiscriminator(opt_net['in_nc'], n_layers=opt_net['n_layers'])
+        netD = arch.NLayerDiscriminator(
+            opt_net['in_nc'], n_layers=opt_net['n_layers'])
     elif which_model == 'DSGAN':
         netD = arch.DiscriminatorBasic(n_input_channels=opt_net['in_nc'])
     else:
-        raise NotImplementedError('Discriminator model [{:s}] not recognized'.format(which_model))
+        raise NotImplementedError(
+            'Discriminator model [{:s}] not recognized'.format(which_model))
 
     init_weights(netD, init_type='kaiming', scale=1)
     if gpu_ids:
-        netD = nn.DataParallel(netD)
+        #netD = nn.DataParallel(netD)
+        netD = netD.to('cuda')
     return netD
+
 
 def define_pairD(opt):
     gpu_ids = opt['gpu_ids']
@@ -199,32 +213,37 @@ def define_pairD(opt):
     which_model = opt_net['which_model_pairD']
 
     if which_model == 'discriminator_vgg_128':
-        netD = arch.Discriminator_VGG_128(in_nc=opt_net['in_nc'], nf=opt_net['nf'])
+        netD = arch.Discriminator_VGG_128(
+            in_nc=opt_net['in_nc'], nf=opt_net['nf'])
 
     elif which_model == 'dis_acd':  # sft-gan, Auxiliary Classifier Discriminator
         netD = sft_arch.ACD_VGG_BN_96()
     elif which_model == 'discriminator_vgg_96':
-        netD = arch.Discriminator_VGG_96(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_96(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                         norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_192':
-        netD = arch.Discriminator_VGG_192(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_192(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                          norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_48':
-        netD = arch.Discriminator_VGG_48(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'], \
-            norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
+        netD = arch.Discriminator_VGG_48(in_nc=opt_net['in_nc'], base_nf=opt_net['nf'],
+                                         norm_type=opt_net['norm_type'], mode=opt_net['mode'], act_type=opt_net['act_type'])
     elif which_model == 'discriminator_vgg_128_SN':
         netD = arch.Discriminator_VGG_128_SN()
     elif which_model == 'discriminator_vgg_128':
         netD = arch.Discriminator_VGG_128()
     elif which_model == 'discriminator_patch':
-        netD = arch.NLayerDiscriminator(opt_net['in_nc'], opt_net['nf'], opt_net['n_layers'])
+        netD = arch.NLayerDiscriminator(
+            opt_net['in_nc'], opt_net['nf'], opt_net['n_layers'])
     else:
-        raise NotImplementedError('Discriminator model [{:s}] not recognized'.format(which_model))
+        raise NotImplementedError(
+            'Discriminator model [{:s}] not recognized'.format(which_model))
 
     init_weights(netD, init_type='kaiming', scale=1)
     if gpu_ids:
-        netD = nn.DataParallel(netD)
+        #netD = nn.DataParallel(netD)
+        netD = netD.to('cuda')
     return netD
+
 
 def define_patchD(opt):
     gpu_ids = opt['gpu_ids']
@@ -238,11 +257,14 @@ def define_patchD(opt):
         net_patchD = arch.FS_Discriminator(kernel_size=kernel_size, D_arch='FSD',
                                            filter_type=FS_type, norm_layer=norm_layer)
     else:
-        raise NotImplementedError('Patch Discriminator model [{:s}] not recognized'.format(opt_net))
+        raise NotImplementedError(
+            'Patch Discriminator model [{:s}] not recognized'.format(opt_net))
     init_weights(net_patchD, init_type='kaiming', scale=1)
     if gpu_ids:
-        netD = nn.DataParallel(net_patchD)
+        #netD = nn.DataParallel(net_patchD)
+        netD = net_patchD.to('cuda')
     return netD
+
 
 def define_F(opt, use_bn=False):
     gpu_ids = opt['gpu_ids']
@@ -252,10 +274,11 @@ def define_F(opt, use_bn=False):
         feature_layer = 49
     else:
         feature_layer = 34
-    netF = arch.VGGFeatureExtractor(feature_layer=feature_layer, use_bn=use_bn, \
-        use_input_norm=True, device=device)
+    netF = arch.VGGFeatureExtractor(feature_layer=feature_layer, use_bn=use_bn,
+                                    use_input_norm=True, device=device)
     # netF = arch.ResNet101FeatureExtractor(use_input_norm=True, device=device)
     if gpu_ids:
-        netF = nn.DataParallel(netF)
+        #netF = nn.DataParallel(netF)
+        netF = netF.to('cuda')
     netF.eval()  # No need to train
     return netF

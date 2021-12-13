@@ -1,9 +1,13 @@
-face_sr:
+# Source: Supervised label on HR, need to generate LR
+# Target: No label, only LR available
+
+facesr:
   tdsr:
-    source: 'D:/Dataset/face_dataset_comp/train_source'
-    target: 'D:/Dataset/face_dataset_comp/train_HR'
-    valid_hr: 'D:/Dataset/face_dataset_comp/valid_HR'
-    valid_lr: 'D:/Dataset/face_dataset_comp/valid_LR'
+    #source: 'D:/Dataset/face_dataset_comp/train'
+    source: 'E:/Dataset/RealSR(V3)/Canon/Train/4/LR'
+    target: 'D:/Dataset/FFHQ_work/train_512'
+    valid_hr: 'D:/Dataset/DIV2K/DIV2K_valid_HR'
+    valid_lr: 'D:/Dataset/DIV2K/DIV2K_valid_LR_unknown'
 
 
 ntire2020:

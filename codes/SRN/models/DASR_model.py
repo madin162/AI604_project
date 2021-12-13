@@ -1,3 +1,7 @@
+import utils.util as util
+from models.modules.architecture import FilterHigh, FilterLow
+from utils.util import b_split, b_merge
+from pytorch_wavelets import DWTForward, DWTInverse
 import sys
 import os
 import cv2
@@ -11,13 +15,9 @@ from utils.util import forward_chop
 import models.networks as networks
 from .base_model import BaseModel
 from models.modules.loss import GANLoss, GradientPenaltyLoss, PerceptualLoss
-logger = logging.getLogger('base')
-from pytorch_wavelets import DWTForward, DWTInverse
-from utils.util import b_split, b_merge
-from models.modules.architecture import FilterHigh, FilterLow
 from PerceptualSimilarity.models.util import PerceptualLoss as val_lpips
-import utils.util as util
 from PerceptualSimilarity.util import util as util_LPIPS
+logger = logging.getLogger('base')
 
 
 class DASR_Model(BaseModel):
@@ -35,6 +35,7 @@ class DASR_Model(BaseModel):
         self.cri_gan = GANLoss(train_opt['gan_type'], 1.0, 0.0).to(self.device)
         self.l_gan_H_target_w = train_opt['gan_H_target']
         self.l_gan_H_source_w = train_opt['gan_H_source']
+        self.face_mask_coef = train_opt['face_mask_coef']
         # define networks and load pretrained models
 
         self.netG = networks.define_G(opt).to(self.device)  # G
@@ -43,7 +44,8 @@ class DASR_Model(BaseModel):
                 self.netD_target = networks.define_D(opt).to(self.device)  # D
                 self.netD_target.train()
             if self.l_gan_H_source_w > 0:
-                self.netD_source = networks.define_pairD(opt).to(self.device)  # D
+                self.netD_source = networks.define_pairD(
+                    opt).to(self.device)  # D
                 self.netD_source.train()
             self.netG.train()
 
@@ -53,21 +55,26 @@ class DASR_Model(BaseModel):
         self.norm = train_opt['norm']
         if train_opt['fs'] == 'wavelet':
             # Wavelet
-            self.DWT2 = DWTForward(J=1, mode='reflect', wave='haar').to(self.device)
+            self.DWT2 = DWTForward(J=1, mode='reflect',
+                                   wave='haar').to(self.device)
             self.fs = self.wavelet_s
-            self.filter_high = FilterHigh(kernel_size=train_opt['fs_kernel_size'], gaussian=True).to(self.device)
+            self.filter_high = FilterHigh(
+                kernel_size=train_opt['fs_kernel_size'], gaussian=True).to(self.device)
         elif train_opt['fs'] == 'gau':
             # Gaussian
             self.filter_low, self.filter_high = FilterLow(kernel_size=train_opt['fs_kernel_size'], gaussian=True).to(self.device), \
-                                            FilterHigh(kernel_size=train_opt['fs_kernel_size'], gaussian=True).to(self.device)
+                FilterHigh(kernel_size=train_opt['fs_kernel_size'], gaussian=True).to(
+                    self.device)
             self.fs = self.filter_func
         elif train_opt['fs'] == 'avgpool':
             # avgpool
             self.filter_low, self.filter_high = FilterLow(kernel_size=train_opt['fs_kernel_size']).to(self.device), \
-                                            FilterHigh(kernel_size=train_opt['fs_kernel_size']).to(self.device)
+                FilterHigh(kernel_size=train_opt['fs_kernel_size']).to(
+                    self.device)
             self.fs = self.filter_func
         else:
-            raise NotImplementedError('FS type [{:s}] not recognized.'.format(train_opt['fs']))
+            raise NotImplementedError(
+                'FS type [{:s}] not recognized.'.format(train_opt['fs']))
 
         # define losses, optimizer and scheduler
         if self.is_train:
@@ -79,7 +86,8 @@ class DASR_Model(BaseModel):
                 elif l_pix_type == 'l2':
                     self.cri_pix = nn.MSELoss().to(self.device)
                 else:
-                    raise NotImplementedError('Loss type [{:s}] not recognized.'.format(l_pix_type))
+                    raise NotImplementedError(
+                        'Loss type [{:s}] not recognized.'.format(l_pix_type))
                 self.l_pix_w = train_opt['pixel_weight']
                 self.l_pix_LL_w = train_opt['pixel_LL_weight']
                 self.sup_LL = train_opt['sup_LL']
@@ -97,13 +105,16 @@ class DASR_Model(BaseModel):
                 elif self.l_fea_type == 'LPIPS':
                     self.cri_fea = PerceptualLoss().to(self.device)
                 else:
-                    raise NotImplementedError('Loss type [{:s}] not recognized.'.format(self.l_fea_type))
+                    raise NotImplementedError(
+                        'Loss type [{:s}] not recognized.'.format(self.l_fea_type))
                 self.l_fea_w = train_opt['feature_weight']
             else:
                 logger.info('Remove feature loss.')
                 self.cri_fea = None
-            if self.cri_fea and self.l_fea_type in ['l1', 'l2']:  # load VGG perceptual loss
-                self.netF = networks.define_F(opt, use_bn=False).to(self.device)
+            # load VGG perceptual loss
+            if self.cri_fea and self.l_fea_type in ['l1', 'l2']:
+                self.netF = networks.define_F(
+                    opt, use_bn=False).to(self.device)
 
             # D_update_ratio and D_init_iters are for WGAN
             self.G_update_inter = train_opt['G_update_inter']
@@ -114,7 +125,8 @@ class DASR_Model(BaseModel):
             if train_opt['gan_type'] == 'wgan-gp':
                 self.random_pt = torch.Tensor(1, 1, 1, 1).to(self.device)
                 # gradient penalty loss
-                self.cri_gp = GradientPenaltyLoss(device=self.device).to(self.device)
+                self.cri_gp = GradientPenaltyLoss(
+                    device=self.device).to(self.device)
                 self.l_gp_w = train_opt['gp_weigth']
 
             # optimizers
@@ -125,30 +137,34 @@ class DASR_Model(BaseModel):
                 if v.requires_grad:
                     optim_params.append(v)
                 else:
-                    logger.warning('Params [{:s}] will not optimize.'.format(k))
-            self.optimizer_G = torch.optim.Adam(optim_params, lr=train_opt['lr_G'], \
-                weight_decay=wd_G, betas=(train_opt['beta1_G'], 0.999))
+                    logger.warning(
+                        'Params [{:s}] will not optimize.'.format(k))
+            self.optimizer_G = torch.optim.Adam(optim_params, lr=train_opt['lr_G'],
+                                                weight_decay=wd_G, betas=(train_opt['beta1_G'], 0.999))
             self.optimizers.append(self.optimizer_G)
             # D
             if self.l_gan_H_target_w > 0:
                 wd_D = train_opt['weight_decay_D'] if train_opt['weight_decay_D'] else 0
-                self.optimizer_D_target = torch.optim.Adam(self.netD_target.parameters(), lr=train_opt['lr_D'], \
-                    weight_decay=wd_D, betas=(train_opt['beta1_D'], 0.999))
+                self.optimizer_D_target = torch.optim.Adam(self.netD_target.parameters(), lr=train_opt['lr_D'],
+                                                           weight_decay=wd_D, betas=(train_opt['beta1_D'], 0.999))
                 self.optimizers.append(self.optimizer_D_target)
 
             if self.l_gan_H_source_w > 0:
                 wd_D = train_opt['weight_decay_D'] if train_opt['weight_decay_D'] else 0
-                self.optimizer_D_source = torch.optim.Adam(self.netD_source.parameters(), lr=train_opt['lr_D'], \
-                    weight_decay=wd_D, betas=(train_opt['beta1_D'], 0.999))
+                self.optimizer_D_source = torch.optim.Adam(self.netD_source.parameters(), lr=train_opt['lr_D'],
+                                                           weight_decay=wd_D, betas=(train_opt['beta1_D'], 0.999))
                 self.optimizers.append(self.optimizer_D_source)
 
             # schedulers
             if train_opt['lr_scheme'] == 'MultiStepLR':
                 for optimizer in self.optimizers:
-                    self.schedulers.append(lr_scheduler.MultiStepLR(optimizer, \
-                        train_opt['lr_steps'], train_opt['lr_gamma']))
+                    self.schedulers.append(lr_scheduler.MultiStepLR(optimizer,
+                                                                    train_opt['lr_steps'], train_opt['lr_gamma']))
             else:
-                raise NotImplementedError('MultiStepLR learning rate scheme is enough.')
+                raise NotImplementedError(
+                    'MultiStepLR learning rate scheme is enough.')
+
+            # Add loss with face heatmap masking
 
             self.log_dict = OrderedDict()
         # print network
@@ -156,7 +172,8 @@ class DASR_Model(BaseModel):
 
         # # Debug
         if self.val_lpips:
-            self.cri_fea_lpips = val_lpips(model='net-lin', net='alex').to(self.device)
+            self.cri_fea_lpips = val_lpips(
+                model='net-lin', net='vgg').to(self.device)
 
     def feed_data(self, data, istrain):
         # LR
@@ -166,6 +183,8 @@ class DASR_Model(BaseModel):
             fake_w = data['fake_w'].to(self.device)
             real_LR = data['LR_real'].to(self.device)
             fake_LR = data['LR_fake'].to(self.device)
+            self.face_mask = data['face_mask'].to(self.device)
+            self.face_mask = self.face_mask * self.face_mask_coef
 
             self.var_L = torch.cat([fake_LR, real_LR], dim=0)
             self.var_H = torch.cat([HR_pair, HR_unpair], dim=0)
@@ -186,9 +205,6 @@ class DASR_Model(BaseModel):
             else:
                 self.needHR = False
 
-
-
-
     def optimize_parameters(self, step):
         # G
         self.fake_H = self.netG(self.var_L)
@@ -199,25 +215,32 @@ class DASR_Model(BaseModel):
         # Fake data
         self.fake_SR_source, _ = b_split(self.fake_H, self.mask)
         self.fake_SR_LL_source, _ = b_split(self.fake_LL, self.mask)
-        self.fake_SR_Hf_source, self.fake_SR_Hf_target = b_split(self.fake_Hc, self.mask)
+        self.fake_SR_Hf_source, self.fake_SR_Hf_target = b_split(
+            self.fake_Hc, self.mask)
 
         # Real data
         self.real_HR_source, _ = b_split(self.var_H, self.mask)
         self.real_HR_LL_source, _ = b_split(self.real_LL, self.mask)
-        self.real_HR_Hf_source, self.real_HR_Hf_target = b_split(self.real_Hc, self.mask)
+        self.real_HR_Hf_source, self.real_HR_Hf_target = b_split(
+            self.real_Hc, self.mask)
 
         if step % self.G_update_inter == 0:
             l_g_total = 0
             if self.cri_pix:  # pixel loss
                 if self.multiweights:
                     l_g_pix = self.l_pix_w * \
-                              torch.mean(self.weights * torch.abs(self.fake_SR_source - self.real_HR_source))
+                        torch.mean(
+                            self.weights * torch.abs(self.fake_SR_source - self.real_HR_source)) + \
+                        torch.mean(
+                            self.face_mask * torch.abs(self.fake_SR_source - self.real_HR_source))
                 else:
-                    l_g_pix = self.cri_pix(self.fake_SR_source, self.real_HR_source)
+                    l_g_pix = self.cri_pix(
+                        self.fake_SR_source, self.real_HR_source)
                 l_g_total += self.l_pix_w * l_g_pix
 
                 if self.sup_LL:
-                    l_g_LL_pix = self.cri_pix(self.fake_SR_LL_source, self.real_HR_LL_source)
+                    l_g_LL_pix = self.cri_pix(
+                        self.fake_SR_LL_source, self.real_HR_LL_source)
                     l_g_total += self.l_pix_LL_w * l_g_LL_pix
 
             if self.l_fea_type in ['l1', 'l2'] and self.cri_fea:  # feature loss
@@ -228,50 +251,59 @@ class DASR_Model(BaseModel):
                 l_g_total += self.l_fea_w * l_g_fea
 
             elif self.l_fea_type == 'LPIPS' and self.cri_fea:
-                l_g_fea = self.cri_fea(self.fake_SR_source, self.real_HR_source)
+                l_g_fea = self.cri_fea(
+                    self.fake_SR_source, self.real_HR_source)
                 l_g_total += self.l_fea_w * l_g_fea
-
 
             # G gan target loss
             if self.l_gan_H_target_w > 0:
-                pred_g_Hf_target_fake = self.netD_target(self.fake_SR_Hf_target)
+                pred_g_Hf_target_fake = self.netD_target(
+                    self.fake_SR_Hf_target)
 
                 if self.ragan:
-                    pred_g_Hf_target_real = self.netD_target(self.real_HR_Hf_target).detach()
+                    pred_g_Hf_target_real = self.netD_target(
+                        self.real_HR_Hf_target).detach()
                     l_g_gan_target_Hf = self.l_gan_H_target_w * \
                         (self.cri_gan(pred_g_Hf_target_fake - pred_g_Hf_target_real.mean(0, keepdim=True), True) +
-                        self.cri_gan(pred_g_Hf_target_real - pred_g_Hf_target_fake.mean(0, keepdim=True), False)) / 2
+                         self.cri_gan(pred_g_Hf_target_real - pred_g_Hf_target_fake.mean(0, keepdim=True), False)) / 2
                 else:
-                    l_g_gan_target_Hf = self.cri_gan(pred_g_Hf_target_fake, True)
+                    l_g_gan_target_Hf = self.cri_gan(
+                        pred_g_Hf_target_fake, True)
                 l_g_total += self.l_gan_H_target_w * l_g_gan_target_Hf
 
             # G_gan_source_loss
             if self.l_gan_H_source_w > 0:
-                pred_g_Hf_source_fake = self.netD_source(self.fake_SR_Hf_source)
+                pred_g_Hf_source_fake = self.netD_source(
+                    self.fake_SR_Hf_source)
                 if self.ragan:
-                    pred_g_Hf_source_real = self.netD_source(self.real_HR_Hf_source).detach()
+                    pred_g_Hf_source_real = self.netD_source(
+                        self.real_HR_Hf_source).detach()
                     l_g_gan_source_Hf = self.l_gan_H_source_w * \
-                               (self.cri_gan(pred_g_Hf_source_fake - pred_g_Hf_source_real.mean(0, keepdim=True), True) +
-                                self.cri_gan(pred_g_Hf_source_real - pred_g_Hf_source_fake.mean(0, keepdim=True), False)) / 2
+                        (self.cri_gan(pred_g_Hf_source_fake - pred_g_Hf_source_real.mean(0, keepdim=True), True) +
+                         self.cri_gan(pred_g_Hf_source_real - pred_g_Hf_source_fake.mean(0, keepdim=True), False)) / 2
                 else:
-                    l_g_gan_source_Hf = self.l_gan_H_source_w * self.cri_gan(pred_g_Hf_source_fake, True)
+                    l_g_gan_source_Hf = self.l_gan_H_source_w * \
+                        self.cri_gan(pred_g_Hf_source_fake, True)
                 l_g_total += l_g_gan_source_Hf
 
             self.optimizer_G.zero_grad()
             l_g_total.backward()
             self.optimizer_G.step()
 
-
         # D
         if step % self.D_update_inter == 0:
 
             # target domain
             if self.l_gan_H_target_w > 0:
-                pred_d_target_real = self.netD_target(self.real_HR_Hf_target.detach())
-                pred_d_target_fake = self.netD_target(self.fake_SR_Hf_target.detach())  # detach to avoid BP to G
+                pred_d_target_real = self.netD_target(
+                    self.real_HR_Hf_target.detach())
+                pred_d_target_fake = self.netD_target(
+                    self.fake_SR_Hf_target.detach())  # detach to avoid BP to G
                 if self.ragan:
-                    l_d_target_real = self.cri_gan(pred_d_target_real - pred_d_target_fake.mean(0, keepdim=True), True)
-                    l_d_target_fake = self.cri_gan(pred_d_target_fake - pred_d_target_real.mean(0, keepdim=True), False)
+                    l_d_target_real = self.cri_gan(
+                        pred_d_target_real - pred_d_target_fake.mean(0, keepdim=True), True)
+                    l_d_target_fake = self.cri_gan(
+                        pred_d_target_fake - pred_d_target_real.mean(0, keepdim=True), False)
                 else:
                     l_d_target_real = self.cri_gan(pred_d_target_real, True)
                     l_d_target_fake = self.cri_gan(pred_d_target_fake, False)
@@ -284,12 +316,16 @@ class DASR_Model(BaseModel):
 
             # source domain
             if self.l_gan_H_source_w > 0:
-                pred_d_source_real = self.netD_source(self.real_HR_Hf_source.detach())
-                pred_d_source_fake = self.netD_source(self.fake_SR_Hf_source.detach())  # detach to avoid BP to G
+                pred_d_source_real = self.netD_source(
+                    self.real_HR_Hf_source.detach())
+                pred_d_source_fake = self.netD_source(
+                    self.fake_SR_Hf_source.detach())  # detach to avoid BP to G
 
                 if self.ragan:
-                    l_d_source_real = self.cri_gan(pred_d_source_real - pred_d_source_fake.mean(0, keepdim=True), True)
-                    l_d_source_fake = self.cri_gan(pred_d_source_fake - pred_d_source_real.mean(0, keepdim=True), False)
+                    l_d_source_real = self.cri_gan(
+                        pred_d_source_real - pred_d_source_fake.mean(0, keepdim=True), True)
+                    l_d_source_fake = self.cri_gan(
+                        pred_d_source_fake - pred_d_source_real.mean(0, keepdim=True), False)
                 else:
                     l_d_source_real = self.cri_gan(pred_d_source_real, True)
                     l_d_source_fake = self.cri_gan(pred_d_source_fake, False)
@@ -314,32 +350,38 @@ class DASR_Model(BaseModel):
             if self.l_gan_H_source_w > 0:
                 self.log_dict['loss/l_g_gan_source_H'] = l_g_gan_source_Hf.item()
 
-
         # if self.opt['train']['gan_type'] == 'wgan-gp':
         #     self.log_dict['l_d_gp'] = l_d_gp.item()
         # D outputs
         if step % self.D_update_inter == 0:
             if self.l_gan_H_target_w > 0:
                 self.log_dict['loss/l_d_target_total'] = l_d_target_total.item()
-                self.log_dict['disc_Score/D_real_target_H'] = torch.mean(pred_d_target_real.detach()).item()
-                self.log_dict['disc_Score/D_fake_target_H'] = torch.mean(pred_d_target_fake.detach()).item()
+                self.log_dict['disc_Score/D_real_target_H'] = torch.mean(
+                    pred_d_target_real.detach()).item()
+                self.log_dict['disc_Score/D_fake_target_H'] = torch.mean(
+                    pred_d_target_fake.detach()).item()
             if self.l_gan_H_source_w > 0:
                 self.log_dict['loss/l_d_total'] = l_d_source_total.item()
-                self.log_dict['disc_Score/D_real_source_H'] = torch.mean(pred_d_source_real.detach()).item()
-                self.log_dict['disc_Score/D_fake_source_H'] = torch.mean(pred_d_source_fake.detach()).item()
-
+                self.log_dict['disc_Score/D_real_source_H'] = torch.mean(
+                    pred_d_source_real.detach()).item()
+                self.log_dict['disc_Score/D_fake_source_H'] = torch.mean(
+                    pred_d_source_fake.detach()).item()
 
     def test(self, tsamples=False):
         self.netG.eval()
         with torch.no_grad():
             if self.chop:
-                self.fake_H = forward_chop(self.var_L, self.scale, self.netG, min_size=320000)
+                self.fake_H = forward_chop(
+                    self.var_L, self.scale, self.netG, min_size=320000)
             else:
                 self.fake_H = self.netG(self.var_L)
             if not tsamples and self.val_lpips:
-                fake_H, real_H = util.tensor2img(self.fake_H), util.tensor2img(self.var_H)
-                fake_H, real_H = fake_H[:, :, [2, 1, 0]], real_H[:, :, [2, 1, 0]]
-                fake_H, real_H = util_LPIPS.im2tensor(fake_H), util_LPIPS.im2tensor(real_H)
+                fake_H, real_H = util.tensor2img(
+                    self.fake_H), util.tensor2img(self.var_H)
+                fake_H, real_H = fake_H[:, :, [
+                    2, 1, 0]], real_H[:, :, [2, 1, 0]]
+                fake_H, real_H = util_LPIPS.im2tensor(
+                    fake_H), util_LPIPS.im2tensor(real_H)
                 self.LPIPS = self.cri_fea_lpips(fake_H, real_H)[0][0][0][0]
             self.netG.train()
 
@@ -353,7 +395,8 @@ class DASR_Model(BaseModel):
             out_dict['hf'] = self.filter_high(self.fake_H).float().cpu()
             out_dict['gt_hf'] = self.filter_high(self.var_H).float().cpu()
             out_dict['HR'] = self.var_H.detach()[0].float().cpu()
-            out_dict['HR_hf'] = self.filter_high(self.var_H).detach().float().cpu()
+            out_dict['HR_hf'] = self.filter_high(
+                self.var_H).detach().float().cpu()
         if not tsamples:
             out_dict['SR'] = self.fake_H.detach()[0].float().cpu()
         else:
@@ -373,7 +416,8 @@ class DASR_Model(BaseModel):
         else:
             net_struc_str = '{}'.format(self.netG.__class__.__name__)
 
-        logger.info('Network G structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+        logger.info(
+            'Network G structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
         logger.info(s)
         if self.is_train:
 
@@ -384,11 +428,12 @@ class DASR_Model(BaseModel):
                     net_struc_str = '{} - {}'.format(self.netD_target.__class__.__name__,
                                                      self.netD_target.module.__class__.__name__)
                 else:
-                    net_struc_str = '{}'.format(self.netD_target.__class__.__name__)
+                    net_struc_str = '{}'.format(
+                        self.netD_target.__class__.__name__)
 
-                logger.info('Network D_target structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+                logger.info('Network D_target structure: {}, with parameters: {:,d}'.format(
+                    net_struc_str, n))
                 logger.info(s)
-
 
             if self.l_gan_H_source_w > 0:
 
@@ -398,37 +443,43 @@ class DASR_Model(BaseModel):
                     net_struc_str = '{} - {}'.format(self.netD_source.__class__.__name__,
                                                      self.netD_source.module.__class__.__name__)
                 else:
-                    net_struc_str = '{}'.format(self.netD_source.__class__.__name__)
+                    net_struc_str = '{}'.format(
+                        self.netD_source.__class__.__name__)
 
-                logger.info('Network D_source structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+                logger.info('Network D_source structure: {}, with parameters: {:,d}'.format(
+                    net_struc_str, n))
                 logger.info(s)
 
-            if self.cri_fea and self.l_fea_type in ['l1', 'l2']:  # F, Perceptual Network
+            # F, Perceptual Network
+            if self.cri_fea and self.l_fea_type in ['l1', 'l2']:
                 s, n = self.get_network_description(self.netF)
                 if isinstance(self.netF, nn.DataParallel):
                     net_struc_str = '{} - {}'.format(self.netF.__class__.__name__,
-                                                    self.netF.module.__class__.__name__)
+                                                     self.netF.module.__class__.__name__)
                 else:
                     net_struc_str = '{}'.format(self.netF.__class__.__name__)
 
-                logger.info('Network F structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+                logger.info(
+                    'Network F structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
                 logger.info(s)
 
     def load(self):
         load_path_G = self.opt['path']['pretrain_model_G']
         if load_path_G is not None:
-            logger.info('Loading pretrained model for G [{:s}] ...'.format(load_path_G))
+            logger.info(
+                'Loading pretrained model for G [{:s}] ...'.format(load_path_G))
             self.load_network(load_path_G, self.netG)
-
 
         load_path_D_target = self.opt['path']['pretrain_model_D_target']
         if self.opt['is_train'] and load_path_D_target is not None:
-            logger.info('Loading pretrained model for D_target [{:s}] ...'.format(load_path_D_target))
+            logger.info('Loading pretrained model for D_target [{:s}] ...'.format(
+                load_path_D_target))
             self.load_network(load_path_D_target, self.netD_target)
 
         load_path_D_source = self.opt['path']['pretrain_model_D_source']
         if self.opt['is_train'] and load_path_D_source is not None:
-            logger.info('Loading pretrained model for D_source [{:s}] ...'.format(load_path_D_source))
+            logger.info('Loading pretrained model for D_source [{:s}] ...'.format(
+                load_path_D_source))
             self.load_network(load_path_D_source, self.netD_source)
 
     def save(self, iter_step):
@@ -445,8 +496,8 @@ class DASR_Model(BaseModel):
             LL, Hc = LL * 0.5, Hc * 0.5 + 0.5  # norm [0, 1]
 
         LH, HL, HH = Hc[:, :, 0, :, :], \
-                     Hc[:, :, 1, :, :], \
-                     Hc[:, :, 2, :, :]
+            Hc[:, :, 1, :, :], \
+            Hc[:, :, 2, :, :]
         Hc = torch.cat((LH, HL, HH), dim=1)
         return LL, Hc
 
@@ -455,5 +506,3 @@ class DASR_Model(BaseModel):
         if norm:
             high_f = high_f * 0.5 + 0.5
         return low_f, high_f
-
-

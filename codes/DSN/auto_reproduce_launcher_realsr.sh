@@ -9,3 +9,7 @@ python create_dataset_modified.py --dataset realsr_tdrealsr \
                                   --checkpoint ../../DSN_experiments/0603_DSN/checkpoints/last_iteration.tar \
                                   --generator DeResnet --discriminator FSD  \
                                   --name 0603_DSN_LRs_realsr
+
+
+
+python create_dataset_modified.py --dataset facesr_tdsr --filter wavelet --checkpoint ../../DSN_experiments/0618_DeResnet+wavcat+FSD+wtex0.03/checkpoints/last_iteration.tar --generator DeResnet --discriminator FSD  --name 0618_DSN_LRs_realsr

@@ -15,6 +15,8 @@ import options.options as option
 from utils import util
 from data import create_dataloader, create_dataset
 from models import create_model
+import datetime
+import json
 
 
 def main():
@@ -53,7 +55,8 @@ def main():
     # tensorboard logger
     if opt['use_tb_logger'] and 'debug' not in opt['name']:
         from tensorboardX import SummaryWriter
-        tb_logger = SummaryWriter(logdir='../../SRN_tb_logger/' + opt['name'])
+        tb_logger = SummaryWriter(logdir='../../SRN_tb_logger/' +
+                                  opt['name'])
 
     # random seed
     seed = opt['train']['manual_seed']
@@ -101,32 +104,58 @@ def main():
         current_step = 0
         start_epoch = 0
 
+    # Freeze encoder parts
+    #searchfor = ['encode', 'head', 'to_rgb', 'middle_0']
+    searchfor = ['encode', 'head', 'to_rgb', 'middle']
+    for k, param in model.netG.named_parameters():
+        if any([srch in k for srch in searchfor]):
+            print("{0}".format(str(k)))
+            param.requires_grad = False
+
+    # DEBUG
+    # total_iters = 200
+
     # training
     logger.info('Start training from epoch: {:d}, iter: {:d}'.format(
         start_epoch, current_step))
+    del resume_state
+    tic = time.time()
     for epoch in range(start_epoch, total_epochs):
         for _, train_data in enumerate(train_loader):
+
             current_step += 1
-            if current_step > total_iters:
-                break
+            # if current_step > total_iters:
+            #    print("debug done")
+            #    return 0
+
             # update learning rate
             model.update_learning_rate()
 
-            # training
+            train_data['LR_real'] = transforms.Resize(
+                [512, 512])(train_data['LR_real'])
+            train_data['LR_fake'] = transforms.Resize(
+                [512, 512])(train_data['LR_fake'])
+
+            # print(train_data['fake_w'].size())
+            # print(train_data['fake_w'].min())
+            # print(train_data['fake_w'].max())
             model.feed_data(train_data, True)
             model.optimize_parameters(current_step)
 
             # log
             if current_step % opt['logger']['print_freq'] == 0:
                 logs = model.get_current_log()
-                message = '<epoch:{:3d}, iter:{:8,d}, lr:{:.3e}> '.format(
-                    epoch, current_step, model.get_current_learning_rate())
+                message = '<epoch:{:3d}, iter:{:8,d}, lr:{:.3e}, time from last print:{:3d} s>'.format(
+                    epoch, current_step, model.get_current_learning_rate(), int(time.time()-tic))
+                print(logs.items())
                 for k, v in logs.items():
                     message += '{:s}: {:.4e} '.format(k, v)
                     # tensorboard logger
-                    if opt['use_tb_logger'] and 'debug' not in opt['name']:
+                    # if opt['use_tb_logger'] and 'debug' not in opt['name']:
+                    if opt['use_tb_logger']:
                         tb_logger.add_scalar(k, v, current_step)
                 logger.info(message)
+                tic = time.time()
 
             # training samples
             if opt['train']['save_tsamples'] and current_step % opt['train']['save_tsamples'] == 0:
@@ -145,38 +174,39 @@ def main():
                         opt['datasets']['train']['dataroot_real_LR'], real_LRs[random_index])
                     HR_path = os.path.join(
                         opt['datasets']['train']['dataroot_HR'], HRs[random_index])
-                    fake_LR = np.array(Image.open(fake_LR_path))
-                    real_LR = np.array(Image.open(real_LR_path))
+                    fake_LR = np.array(Image.open(
+                        fake_LR_path).resize((512, 512)))
+                    real_LR = np.array(Image.open(
+                        real_LR_path).resize((512, 512)))
                     HR = np.array(Image.open(HR_path))
 
-                    h, w, _ = fake_LR.shape
-                    fake_LR = fake_LR[h // 2 - 64:h //
-                                      2 + 64, w//2 - 64:w//2+64, :]
-                    h, w, _ = HR.shape
-                    HR = HR[h // 2 - 64*4:h // 2 +
-                            64*4, w//2 - 64*4:w//2+64*4, :]
+                    #h, w, _ = fake_LR.shape
+                    # fake_LR = fake_LR[h // 2 - 64:h //
+                    #                  2 + 64, w//2 - 64:w//2+64, :]
+                    #h, w, _ = HR.shape
+                    # HR = HR[h // 2 - 64*4:h // 2 +
+                    #        64*4, w//2 - 64*4:w//2+64*4, :]
 
-                    h, w, _ = real_LR.shape
-                    real_LR = real_LR[h // 2 - 64:h //
-                                      2 + 64, w//2 - 64:w//2+64, :]
+                    #h, w, _ = real_LR.shape
+                    # real_LR = real_LR[h // 2 - 64:h //
+                    #                  2 + 64, w//2 - 64:w//2+64, :]
 
                     fake_LR_temp = np.ascontiguousarray(
                         np.transpose(fake_LR, (2, 0, 1)))
                     real_LR_temp = np.ascontiguousarray(
                         np.transpose(real_LR, (2, 0, 1)))
 
-                    fake_LR = np.zeros((np.shape(fake_LR_temp)[0], 42, 42))
-                    fake_LR[:, :np.shape(fake_LR_temp)[1], :np.shape(
-                        fake_LR_temp)[2]] = fake_LR_temp
-                    real_LR = np.zeros((np.shape(real_LR_temp)[0], 42, 42))
-                    real_LR[:, :np.shape(real_LR_temp)[1], :np.shape(
-                        real_LR_temp)[2]] = real_LR_temp
+                    #fake_LR = np.zeros((np.shape(fake_LR_temp)[0], 42, 42))
+                    # fake_LR[:, :np.shape(fake_LR_temp)[1], :np.shape(
+                    #    fake_LR_temp)[2]] = fake_LR_temp
+                    #real_LR = np.zeros((np.shape(real_LR_temp)[0], 42, 42))
+                    # real_LR[:, :np.shape(real_LR_temp)[1], :np.shape(
+                    #    real_LR_temp)[2]] = real_LR_temp
 
                     fake_LR = torch.from_numpy(
-                        fake_LR).float().unsqueeze(0) / 255
+                        fake_LR_temp).float().unsqueeze(0) / 255
                     real_LR = torch.from_numpy(
-                        real_LR).float().unsqueeze(0) / 255
-
+                        real_LR_temp).float().unsqueeze(0) / 255
                     HR = torch.from_numpy(np.ascontiguousarray(
                         np.transpose(HR, (2, 0, 1)))).float().unsqueeze(0) / 255
                     LR = torch.cat([fake_LR, real_LR], dim=0)
@@ -192,14 +222,18 @@ def main():
                     HR = visuals['HR']
                     HR_hf = visuals['HR_hf'][0]
 
-                    # image_1 = torch.cat([fake_LR[0], fake_SR[0]], dim=2)
-                    # image_2 = torch.cat([real_LR[0], real_SR[0]], dim=2)
+                    #image_1 = torch.cat([fake_LR[0], fake_SR[0]], dim=2)
+                    #image_2 = torch.cat([real_LR[0], real_SR[0]], dim=2)
 
-                    #image_1 = np.clip(torch.cat([fake_SR, HR, real_SR], dim=2), 0, 1)
-                    #image_2 = np.clip(torch.cat([fake_hf, HR_hf, real_hf], dim=2), 0, 1)
-                    #image = torch.cat([image_1, image_2], dim=1)
-                    #tb_logger.add_image('train/train_samples_{}'.format(str(i)), image, current_step)
-                #logger.info('Saved training Samples')
+                    image_1 = np.clip(
+                        torch.cat([fake_SR, HR, real_SR], dim=2), 0, 1)
+                    image_2 = np.clip(
+                        torch.cat([fake_hf, HR_hf, real_hf], dim=2), 0, 1)
+                    image = torch.cat([image_1, image_2], dim=1)
+                    tb_logger.add_image(
+                        'train/train_samples_{}'.format(str(i)), image, current_step)
+                    #    'train/train_samples_{}'.format(str(i)), image, current_step)
+                # logger.info('Saved training Samples')
 
             # validation
             if current_step % opt['train']['val_freq'] == 0:
@@ -213,6 +247,8 @@ def main():
                     img_dir = os.path.join(opt['path']['val_images'], img_name)
                     util.mkdir(img_dir)
 
+                    val_data['LR'] = transforms.Resize(
+                        [512, 512])(val_data['LR'])
                     model.feed_data(val_data, False)
                     model.test()
 
@@ -236,7 +272,7 @@ def main():
                         # print('img:', val_data['HR_path'][0].split('/')[-1], 'LPIPS: %.3f' % lpips.numpy())
                     # else:
                     #     print('img:', val_data['LR_path'][0].split('/')[-1])
-                    logger.info(log_info)
+                    # logger.info(log_info)
                     # Save SR images for reference
                     save_img_path = os.path.join(img_dir, '{:s}_{:d}.png'.format(
                         img_name, current_step))
@@ -247,10 +283,8 @@ def main():
                         crop_size = opt['scale']
                         gt_img = gt_img / 255.
                         sr_img = sr_img / 255.
-                        cropped_sr_img = sr_img[crop_size:-
-                                                crop_size, crop_size:-crop_size, :]
-                        cropped_gt_img = gt_img[crop_size:-
-                                                crop_size, crop_size:-crop_size, :]
+                        cropped_sr_img = sr_img
+                        cropped_gt_img = gt_img
                         avg_psnr += util.calculate_psnr(
                             cropped_sr_img * 255, cropped_gt_img * 255)
                 avg_psnr = avg_psnr / idx
@@ -276,10 +310,9 @@ def main():
                 logger.info('Saving models and training states.')
                 model.save(current_step)
                 model.save_training_state(epoch, current_step)
-
-    logger.info('Saving the final model.')
-    model.save('latest')
-    logger.info('End of training.')
+    # for i in range(1, 3):
+    #    iter, train_data = next(enumerate(train_loader))
+    # print(type(train_data))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,1 @@
+python create_dataset_modified.py --dataset facesr --filter wavelet --checkpoint ../../DSN_experiments/RealSR_pretrained/checkpoints/RealSR_DeResnet_FSD.tar --generator DeResnet --norm_layer Batch --discriminator FSD  --name pretrained_AIM_facesr --filter avg_pool

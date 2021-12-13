@@ -12,7 +12,7 @@ def create_model(opt):
     elif model == 'srragan':
         from .SRRaGAN_model import SRRaGANModel as M
     elif model == 'De_Resnet':
-        from .Degradation_Resnet import  DegrationModel as M
+        from .Degradation_Resnet import DegrationModel as M
     elif model == 'De_patch_wavelet_GAN':
         from .DePatchGAN_wavelet_model import DePatch_wavelet_GANModel as M
     elif model == 'DASR':

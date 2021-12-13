@@ -133,3 +133,5 @@ DSN_experiments/
 DSN_tb_logger/
 SRN_experiments/
 SRN_tb_logger/
+SRN_results/
+premodel/
