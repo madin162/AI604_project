@@ -1,0 +1,1 @@
+python create_dataset_modified.py --dataset facesr --checkpoint ../../DSN_experiments/iteration_100161.tar --generator DeResnet --discriminator FSD  --filter wavelet --name pretrained_celeba_ny 

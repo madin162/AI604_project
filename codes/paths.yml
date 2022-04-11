@@ -2,10 +2,16 @@
 # Target: No label, only LR available
 
 facesr:
+  tdsr_nonface:
+    #source: 'D:/Dataset/face_dataset_comp/train'
+    source: 'E:/Dataset/RealSR(V3)/Canon/Train/4/LR' #
+    target: '/D:/Dataset/FFHQ_work/train_512'
+    valid_hr: 'D:/Dataset/DIV2K/DIV2K_valid_HR'
+    valid_lr: 'D:/Dataset/DIV2K/DIV2K_valid_LR_unknown'
   tdsr:
     #source: 'D:/Dataset/face_dataset_comp/train'
-    source: 'E:/Dataset/RealSR(V3)/Canon/Train/4/LR'
-    target: 'D:/Dataset/FFHQ_work/train_512'
+    source: '/storage/dataset/FFHQ_work/train_512' # CelebA LR Face
+    target: '/storage/dataset/FFHQ_work/train_512'
     valid_hr: 'D:/Dataset/DIV2K/DIV2K_valid_HR'
     valid_lr: 'D:/Dataset/DIV2K/DIV2K_valid_LR_unknown'
 

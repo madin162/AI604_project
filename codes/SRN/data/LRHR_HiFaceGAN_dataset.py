@@ -174,7 +174,7 @@ class HiFaceGAN_Dataset(data.Dataset):
             # augmentation - flip, rotate => augment the image here
             img_LR_fake, img_LR_real, img_HR, img_unpair_HR, fake_w, face_mask \
                 = util.augment([img_LR_fake, img_LR_real, img_HR, img_unpair_HR, fake_w, face_mask],
-                               self.opt['use_flip'], self.opt['use_rot'])
+                               self.opt['use_flip'], self.opt['use_rot'],self.opt['use_aug'])
 
             # if self.paths_real_weights:
             #     real_w = util.augment([real_w],

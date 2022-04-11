@@ -9,9 +9,11 @@ import cv2
 import logging
 
 from PIL import Image
+from skimage import transform
+from skimage.transform import SimilarityTransform, AffineTransform
 
 IMG_EXTENSIONS = ['.jpg', '.JPG', '.jpeg', '.JPEG',
-                  '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP']
+                  '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP','.pgm']
 
 ####################
 # Files & IO
@@ -117,11 +119,26 @@ def read_img_seg(env, path):
 ####################
 
 # Augment with image affine transformation here
-def augment(img_list, hflip=True, rot=True):
+def augment(img_list, hflip=True, rot=True, augment_img=False, max_scale=0.01, max_rotation=0.005, max_shift=0.001, max_shear=0, mode='edge'):
+    scale = (np.random.uniform(1-max_scale, 1 + max_scale),
+             np.random.uniform(1-max_scale, 1 + max_scale))
+    rotation_tmp = np.random.uniform(-1*max_rotation, max_rotation)
+    translation = (np.random.uniform(-1*max_shift, max_shift),
+                   np.random.uniform(-1*max_shift, max_shift))
+    shear = np.random.uniform(-1*max_shear, max_shear)
+
     # horizontal flip OR rotate
     hflip = hflip and random.random() < 0.5
     vflip = rot and random.random() < 0.5
     rot90 = rot and random.random() < 0.5
+
+    tform = AffineTransform(
+        scale=scale,  # ,
+        # Convert angles from degrees to radians.
+        rotation=np.rad2deg(rotation_tmp),
+        translation=translation,
+        shear=np.deg2rad(shear)
+    )
 
     def _augment(img):
         if hflip:
@@ -130,6 +147,8 @@ def augment(img_list, hflip=True, rot=True):
             img = img[::-1, :, :]
         if rot90:
             img = img.transpose(1, 0, 2)
+        if augment_img:
+            img = transform.warp(img, tform, mode=mode)
         return img
 
     return [_augment(img) for img in img_list]

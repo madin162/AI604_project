@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.utils.data as data
 import data.util as util
+import cv2
 
 
 class LRDataset(data.Dataset):
@@ -23,6 +24,7 @@ class LRDataset(data.Dataset):
         # get LR image
         LR_path = self.paths_LR[index]
         img_LR = util.read_img(self.LR_env, LR_path)
+        img_LR = cv2.cvtColor(img_LR, cv2.COLOR_GRAY2BGR)
         H, W, C = img_LR.shape
 
         # change color space if necessary

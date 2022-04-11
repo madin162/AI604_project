@@ -67,6 +67,8 @@ def __main__():
 
             data['LR'] = transforms.Resize(
                 [512, 512])(data['LR'])
+            data['HR']= transforms.Resize(
+                [512, 512])(data['HR'])
             model.feed_data(data, False)
             img_path = data['LR_path'][0]
             img_name = os.path.splitext(os.path.basename(img_path))[0]

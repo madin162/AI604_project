@@ -105,8 +105,8 @@ def main():
         start_epoch = 0
 
     # Freeze encoder parts
-    #searchfor = ['encode', 'head', 'to_rgb', 'middle_0']
-    searchfor = ['encode', 'head', 'to_rgb', 'middle']
+    searchfor = ['encode', 'head', 'to_rgb', 'middle_0']
+    #searchfor = ['nonstring']
     for k, param in model.netG.named_parameters():
         if any([srch in k for srch in searchfor]):
             print("{0}".format(str(k)))
@@ -123,7 +123,6 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         for _, train_data in enumerate(train_loader):
 
-            current_step += 1
             # if current_step > total_iters:
             #    print("debug done")
             #    return 0
@@ -310,6 +309,8 @@ def main():
                 logger.info('Saving models and training states.')
                 model.save(current_step)
                 model.save_training_state(epoch, current_step)
+                
+            current_step += 1
     # for i in range(1, 3):
     #    iter, train_data = next(enumerate(train_loader))
     # print(type(train_data))

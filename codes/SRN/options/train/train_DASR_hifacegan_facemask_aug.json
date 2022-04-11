@@ -1,5 +1,5 @@
 {
-    "name": "DASR_SRN_HIFACEGAN_Native_AIM",
+    "name": "DASR_SRN_HIFACEGAN_facemask_aug_propercoef",
     "use_tb_logger": true,
     "model": "DASR",
     "scale": 4,
@@ -21,10 +21,11 @@
             "subset_file": null,
             "use_shuffle": true,
             "n_workers": 6,
-            "batch_size": 2,
+            "batch_size": 1,
             "HR_size": 512,
             "use_flip": true,
-            "use_rot": true
+            "use_rot": true,
+            "use_aug": true
         },
         "val": {
             "name": "validation",
@@ -78,7 +79,7 @@
         "weight_decay_D": 0,
         "beta1_D": 0.9,
         "lr_scheme": "MultiStepLR",
-        "lr_steps": [10000, 20000, 30000, 40000, 50000], // at which steps, decay the learining rate
+        "lr_steps": [2000, 4000, 6000, 8000, 10000], // at which steps, decay the learining rate
         "lr_gamma": 0.5,
         "fs": "wavelet",
         "fs_kernel_size": 9,
@@ -88,20 +89,20 @@
         "pixel_weight": 0.01, // original 0.01
         "pixel_LL_weight": 0,
         "feature_criterion": "LPIPS",
-        "feature_weight": 1, // original: 1
+        "feature_weight": 0.2, // original: 1
         "gan_type": "vanilla",
         "ragan": false,
-        "gan_H_target": 0.005, // original: 0.005
+        "gan_H_target": 0.0005, // original: 0.005
         "gan_H_source": 0,
         "G_update_inter": 1,
         "D_update_inter": 1,
         "manual_seed": 0,
-        "niter": 50000.0,
-        "val_freq": 2500.0,
-        "face_mask_coef": 0 // original: 0.0
+        "niter": 30000.0,
+        "val_freq": 1000.0,
+        "face_mask_coef": 0.02 // original: 0.0
     },
     "logger": {
         "print_freq": 200,
-        "save_checkpoint_freq": 2500.0
+        "save_checkpoint_freq": 1000.0
     }
 }
